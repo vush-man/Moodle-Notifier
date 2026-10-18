@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Moodle -> Telegram notifier (read-only).
 
@@ -269,7 +268,7 @@ def check_deadlines(m, db, cfg, notify, now):
         "core_calendar_get_action_events_by_timesort",
         timesortfrom=now - 3600,
         timesortto=now + 90 * 86400,
-        limitnum=100,
+        limitnum=50,  # Moodle rejects anything above 50
     )
     events = [
         e for e in j.get("events", []) if (e.get("action") or {}).get("actionable", True)
@@ -463,6 +462,8 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    # httpx logs every request URL at INFO, and Telegram's URL contains the bot token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     load_env()
 
     if args.get_chat_id:

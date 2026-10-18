@@ -181,6 +181,8 @@ How the workflow works (`.github/workflows/moodle-bot.yml`):
 - A runner starts fresh every time, so the SQLite state file is saved and restored with `actions/cache`. Caches can't be overwritten, so each run saves under a unique key (`moodle-db-<run id>`) and the next run restores the newest one by prefix.
 - A `concurrency` group prevents two runs from overlapping and racing on the state.
 
+**Where the state lives.** The state is a small SQLite file, `moodle_bot.db`, in the runner's working directory. It is **not** stored in your repository and is never committed. At the start of each run it is restored from the GitHub Actions cache, and at the end it is saved back. You can see the saved copies in your repo under **Actions → Caches**. The file holds only item fingerprints and timestamps (no tokens and no message text). GitHub deletes caches that haven't been used for 7 days, so if the schedule is paused for longer than that, the next run starts from scratch and seeds silently. Anything posted during the gap won't be reported.
+
 **Verify state persistence.** Run the workflow twice by hand. The first run should log `Seeded ... existing items` and send one "bot is running" message. The second run must **not** seed again. If it does, the state isn't being restored and every run would be treated as a first run.
 
 **Minutes and visibility.**
