@@ -13,6 +13,7 @@ Usage:
   python moodle_bot.py --test-telegram   # send a test message
   python moodle_bot.py --once            # one check (first run seeds silently)
   python moodle_bot.py                   # loop forever, every POLL_MINUTES
+  python moodle_bot.py --gen-key         # make a TOKEN_ENCRYPTION_KEY (for /token renewal)
 
 Config comes from environment variables or a .env file (see .env.example).
 
@@ -21,6 +22,7 @@ Telegram delivery and message formatting live in telegram_notifier.py.
 """
 import argparse
 import base64
+import hashlib
 import html
 import logging
 import os
@@ -35,7 +37,14 @@ from urllib.parse import unquote
 
 import httpx
 
-from telegram_notifier import fmt, get_chat_id, make_notifier
+from telegram_notifier import (
+    delete_message,
+    fmt,
+    get_chat_id,
+    get_updates,
+    make_notifier,
+    send_message,
+)
 
 log = logging.getLogger("moodle-bot")
 
@@ -75,6 +84,18 @@ class Cfg:
         self.token = parse_token(os.environ["MOODLE_TOKEN"])
         self.tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
         self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        # Only this Telegram user may send commands (like /token) to the bot.
+        # Defaults to TELEGRAM_CHAT_ID when that is a private chat (a private chat id
+        # equals the user id). For a group chat you must set TELEGRAM_ADMIN_ID.
+        raw_admin = os.environ.get("TELEGRAM_ADMIN_ID", "").strip()
+        if raw_admin.lstrip("-").isdigit():
+            self.tg_admin_id = int(raw_admin)
+        elif self.chat_id.strip().isdigit():
+            self.tg_admin_id = int(self.chat_id)
+        else:
+            self.tg_admin_id = None
+        # Key used to encrypt a token received over Telegram before it is stored.
+        self.token_key = os.environ.get("TOKEN_ENCRYPTION_KEY", "").strip()
         self.poll_minutes = int(os.environ.get("POLL_MINUTES", "15"))
         self.db_path = os.environ.get("DB_PATH", "moodle_bot.db")
         self.reminder_hours = sorted(
@@ -528,13 +549,145 @@ def run_cycle(cfg, m, db, notify, userid):
     log.info("Cycle done: %d courses, %d errors", len(courses), len(errors))
 
 
-def token_alert(db, notify, msg):
+# --------------------------------------------------------------------------
+# Token renewal over Telegram
+#
+# Send "/token moodlemobile://token=..." to the bot in a PRIVATE chat. The token is
+# checked against Moodle, encrypted with TOKEN_ENCRYPTION_KEY, and stored in the state
+# database. It is never stored in plain text: on a public repo the Actions cache can be
+# read by fork workflows, so only the encrypted form may live there.
+# --------------------------------------------------------------------------
+def _fernet(cfg):
+    if not cfg.token_key:
+        return None
+    try:
+        from cryptography.fernet import Fernet
+
+        return Fernet(cfg.token_key.encode())
+    except Exception as e:  # missing package or malformed key
+        log.error("Token encryption unavailable: %s", e)
+        return None
+
+
+def env_token_fp(cfg):
+    return hashlib.sha256(cfg.token.encode()).hexdigest()[:16]
+
+
+def save_token(cfg, db, token):
+    f = _fernet(cfg)
+    if f is None:
+        return False
+    db.set("token_enc", f.encrypt(token.encode()).decode())
+    db.set("token_env_fp", env_token_fp(cfg))
+    return True
+
+
+def effective_token(cfg, db):
+    """The token received over Telegram wins, unless the MOODLE_TOKEN secret has been
+    changed since it was stored (then the newer secret wins)."""
+    enc = db.get("token_enc")
+    if not enc or db.get("token_env_fp") != env_token_fp(cfg):
+        return cfg.token
+    f = _fernet(cfg)
+    if f is None:
+        return cfg.token
+    try:
+        return f.decrypt(enc.encode()).decode()
+    except Exception:
+        log.warning("Stored token could not be decrypted (key changed?); using MOODLE_TOKEN")
+        return cfg.token
+
+
+def handle_telegram_commands(cfg, db):
+    """Process /token messages. Runs BEFORE the Moodle checks, so a new token is used
+    straight away even when the old one has already expired."""
+    if not cfg.tg_token:
+        return
+    offset = db.get("tg_offset")
+    updates = get_updates(cfg.tg_token, int(offset) if offset else None)
+    if updates is None:
+        return
+
+    def reply(chat_id, title, body=""):
+        send_message(cfg.tg_token, chat_id, fmt(title, body))
+
+    for u in updates:
+        db.set("tg_offset", u["update_id"] + 1)  # confirm first: never handled twice
+        msg = u.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        parts = text.split(None, 1)
+        if not parts:
+            continue
+        cmd = parts[0].split("@")[0].lower()
+        if cmd == "/token":
+            arg = parts[1].strip() if len(parts) > 1 else ""
+        elif text.startswith("moodlemobile://"):
+            arg = text  # pasting the bare token string works too
+        else:
+            continue
+
+        chat = msg.get("chat") or {}
+        chat_id, msg_id = chat.get("id"), msg.get("message_id")
+        sender = (msg.get("from") or {}).get("id")
+        if cfg.tg_admin_id is None or sender != cfg.tg_admin_id:
+            continue  # strangers get no reply and no information
+
+        if chat.get("type") != "private":
+            delete_message(cfg.tg_token, chat_id, msg_id)
+            reply(
+                chat_id,
+                "⚠️ Send tokens in a private chat with me",
+                "Other group members may have seen that token. Reset it in Moodle "
+                "(Preferences → User account → Security keys), get a new one, and send "
+                "it to me privately.",
+            )
+            continue
+
+        def finish(title, body=""):
+            delete_message(cfg.tg_token, chat_id, msg_id)  # keep the token out of the chat
+            reply(chat_id, title, body)
+
+        if _fernet(cfg) is None:
+            finish(
+                "❌ Can't store a token yet",
+                "Set a valid TOKEN_ENCRYPTION_KEY secret first (python moodle_bot.py --gen-key).",
+            )
+            continue
+        try:
+            new_token = parse_token(arg)
+        except Exception:
+            finish("❌ I couldn't read that token", "Send: /token moodlemobile://token=...")
+            continue
+        try:
+            info = Moodle(cfg.base, new_token).call("core_webservice_get_site_info")
+        except Exception as e:
+            finish("❌ Moodle rejected that token", str(e)[:200])
+            continue
+        known = db.get("userid")
+        if known and str(info.get("userid")) != known:
+            finish("❌ That token belongs to a different Moodle account", "Not stored.")
+            continue
+        if not save_token(cfg, db, new_token):
+            finish("❌ Could not store the token")
+            continue
+        db.set("userid", info.get("userid"))
+        log.info("Moodle token replaced via Telegram")
+        finish("✅ Moodle token updated", "It will be used from the next check. Your message was deleted.")
+
+
+def token_alert(cfg, db, notify, msg):
     last = int(db.get("token_alert_ts") or 0)
     if time.time() - last > 86400:
         notify(
             fmt(
                 "🔑 Moodle token expired",
-                f"{msg}\nGet a new one via the launch.php step and update MOODLE_TOKEN.",
+                f"{msg}\n"
+                + (
+                    "Send me /token moodlemobile://token=... in a private chat, "
+                    "or update the MOODLE_TOKEN secret."
+                    if cfg.token_key and cfg.tg_admin_id
+                    else "Get a new one via the launch.php step and update MOODLE_TOKEN."
+                ),
             )
         )
         db.set("token_alert_ts", int(time.time()))
@@ -548,6 +701,7 @@ def main():
     ap.add_argument("--once", action="store_true", help="run one check and exit")
     ap.add_argument("--test-telegram", action="store_true")
     ap.add_argument("--get-chat-id", action="store_true")
+    ap.add_argument("--gen-key", action="store_true", help="print a new TOKEN_ENCRYPTION_KEY")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -558,6 +712,14 @@ def main():
     # httpx logs every request URL at INFO, and Telegram's URL contains the bot token.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     load_env()
+
+    if args.gen_key:
+        try:
+            from cryptography.fernet import Fernet
+        except ImportError:
+            sys.exit("Install it first: pip install cryptography")
+        print(Fernet.generate_key().decode())
+        return
 
     if args.get_chat_id:
         if not os.environ.get("TELEGRAM_BOT_TOKEN"):
@@ -580,11 +742,18 @@ def main():
 
     while True:
         try:
+            handle_telegram_commands(cfg, db)  # first, so a new token applies immediately
+        except Exception:
+            log.exception("Telegram command handling failed")
+        m.token = effective_token(cfg, db)
+        try:
             userid = m.call("core_webservice_get_site_info")["userid"]
+            if db.get("userid") is None:
+                db.set("userid", userid)  # remembered so /token can't switch accounts
             run_cycle(cfg, m, db, notify, userid)
         except TokenExpired as e:
             log.error("Token expired: %s", e)
-            token_alert(db, notify, str(e))
+            token_alert(cfg, db, notify, str(e))
         except Exception:
             log.exception("Cycle failed")
         if args.once:

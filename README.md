@@ -39,6 +39,7 @@ It talks to Moodle through the same **mobile web service API** the official Mood
 | **Course materials** | New or updated files, pages, links and folders in any of your courses |
 | **Notification bell** | The same notifications Moodle shows in the web UI |
 | **Health alerts** | A Telegram message if your token expires, or if the bot fails several runs in a row |
+| **Token renewal** | Optional: send `/token ...` to the bot in a private chat to replace an expired Moodle token, stored encrypted |
 
 Other design points:
 
@@ -75,7 +76,7 @@ Every item gets a fingerprint, such as `announce:<discussion id>:<time modified>
 - Python 3.9+ (3.12 recommended)
 - A Moodle site (tested against Moodle 4.5) with the **mobile web service enabled**
 - A Telegram account
-- `httpx` (see `requirements.txt`)
+- `httpx` and `cryptography` (see `requirements.txt`; `cryptography` is only used for token renewal over Telegram)
 
 ## Quick start (local)
 
@@ -102,6 +103,7 @@ If Telegram settings are left empty, notifications are printed to the terminal i
 | `--once` | Run one check and exit (used by GitHub Actions and cron) |
 | `--test-telegram` | Send a test message and exit |
 | `--get-chat-id` | Print the chat IDs your Telegram bot has seen |
+| `--gen-key` | Print a new `TOKEN_ENCRYPTION_KEY` |
 | `-v`, `--verbose` | Debug logging |
 
 ## Getting a Moodle token
@@ -134,7 +136,36 @@ If your browser hides the redirect, copy your `MoodleSession` cookie and run
 
 ### Token lifetime
 
-Tokens expire on a schedule set by your site admin. Check **Profile → Preferences → User account → Security keys** for the "Moodle mobile web service" key and its valid-until date. When the token expires the bot sends you a Telegram alert (at most once a day). Repeat the steps above and update `MOODLE_TOKEN`.
+Tokens expire on a schedule set by your site admin. Check **Profile → Preferences → User account → Security keys** for the "Moodle mobile web service" key and its valid-until date. When the token expires the bot sends you a Telegram alert (at most once a day). Repeat the steps above and update `MOODLE_TOKEN`, or send it to the bot (see below).
+
+### Renewing the token from Telegram (optional)
+
+Instead of editing the GitHub secret by hand, send the new token to the bot from your phone. The bot checks it with Moodle, stores it **encrypted**, deletes your message and confirms.
+
+**One-time setup**
+
+1. Generate an encryption key: `python moodle_bot.py --gen-key`. Save the output as a repository secret named `TOKEN_ENCRYPTION_KEY`. Keep a copy somewhere safe.
+2. If `TELEGRAM_CHAT_ID` is a **group**, also add a secret `TELEGRAM_ADMIN_ID` with your own Telegram user ID. Message the bot privately, run `python moodle_bot.py --get-chat-id`, and use the number for your private chat. (If `TELEGRAM_CHAT_ID` is already your private chat, this is automatic.)
+
+**Renewing**
+
+1. Get a token as described above (the `moodlemobile://token=...` string).
+2. Open a **private chat** with your bot and send `/token moodlemobile://token=...`. Pasting the bare string also works.
+3. You'll get a confirmation. The new token is used from the next run, which can take up to 15 to 30 minutes on GitHub's schedule. To apply it immediately, run the workflow manually from the Actions tab.
+
+**How it's protected**
+
+- Only your Telegram user ID can send commands, and only in a private chat. Messages from anyone else are ignored without a reply.
+- The token is verified against Moodle first, and must belong to the same Moodle account as before.
+- It is stored in the state database only in encrypted form. This matters on public repos, where Actions caches can be read by workflows triggered from forks. They can't read your secrets, so they can't decrypt it.
+- Your message is deleted right after processing. If you paste a token in a group by mistake, the bot warns you and you should reset it in Moodle.
+- If you later update the `MOODLE_TOKEN` secret by hand, the newer secret takes priority over the stored token.
+
+**Caveats**
+
+- The token passes through Telegram's servers. If you're not comfortable with that, update the GitHub secret instead.
+- Nothing else may read this bot's updates (`getUpdates`) or have a webhook set on it, or the two will conflict.
+- If you change `TOKEN_ENCRYPTION_KEY`, the stored token can't be decrypted and the bot falls back to `MOODLE_TOKEN`.
 
 ## Setting up Telegram
 
@@ -155,6 +186,8 @@ Settings come from environment variables, or from a `.env` file in the working d
 | `MOODLE_TOKEN` | yes | | Raw token or `moodlemobile://token=...` string |
 | `TELEGRAM_BOT_TOKEN` | no* | | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | no* | | Chat to send alerts to |
+| `TELEGRAM_ADMIN_ID` | no | chat id if private | Your Telegram user ID: the only user allowed to send `/token`. Required if `TELEGRAM_CHAT_ID` is a group |
+| `TOKEN_ENCRYPTION_KEY` | no | | Enables `/token` renewal. Generate with `--gen-key` |
 | `POLL_MINUTES` | no | `15` | Interval in loop mode (ignored with `--once`) |
 | `REMINDER_HOURS` | no | `24,3` | Reminder windows (hours before) for non-assignment deadlines such as quizzes |
 | `ASSIGN_REMINDER_HOURS` | no | `48,24` | Reminder windows (hours before) for assignments that are not submitted yet |
@@ -174,6 +207,7 @@ This runs the bot for free on a schedule, with no server.
 1. Create a new repository and push the project (the included `.gitignore` keeps `.env` and `*.db` out).
 2. In **Settings → Secrets and variables → Actions**, add these repository **secrets**:
    `MOODLE_URL`, `MOODLE_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+   Optional secrets: `TOKEN_ENCRYPTION_KEY` and `TELEGRAM_ADMIN_ID` (for [token renewal from Telegram](#renewing-the-token-from-telegram-optional)).
    Optionally add a repository **variable** `SKIP_COURSE_IDS`.
 3. Open the **Actions** tab, choose **moodle-bot**, and click **Run workflow**.
 
@@ -183,7 +217,7 @@ How the workflow works (`.github/workflows/moodle-bot.yml`):
 - A runner starts fresh every time, so the SQLite state file is saved and restored with `actions/cache`. Caches can't be overwritten, so each run saves under a unique key (`moodle-db-<run id>`) and the next run restores the newest one by prefix.
 - A `concurrency` group prevents two runs from overlapping and racing on the state.
 
-**Where the state lives.** The state is a small SQLite file, `moodle_bot.db`, in the runner's working directory. It is **not** stored in your repository and is never committed. At the start of each run it is restored from the GitHub Actions cache, and at the end it is saved back. You can see the saved copies in your repo under **Actions → Caches**. The file holds only item fingerprints and timestamps (no tokens and no message text). GitHub deletes caches that haven't been used for 7 days, so if the schedule is paused for longer than that, the next run starts from scratch and seeds silently. Anything posted during the gap won't be reported.
+**Where the state lives.** The state is a small SQLite file, `moodle_bot.db`, in the runner's working directory. It is **not** stored in your repository and is never committed. At the start of each run it is restored from the GitHub Actions cache, and at the end it is saved back. You can see the saved copies in your repo under **Actions → Caches**. The file holds only item fingerprints and timestamps, no message text. If you use token renewal over Telegram it also holds your Moodle token, but only in encrypted form. GitHub deletes caches that haven't been used for 7 days, so if the schedule is paused for longer than that, the next run starts from scratch and seeds silently. Anything posted during the gap won't be reported.
 
 **Verify state persistence.** Run the workflow twice by hand. The first run should log `Seeded ... existing items` and send one "bot is running" message. The second run must **not** seed again. If it does, the state isn't being restored and every run would be treated as a first run.
 
@@ -279,6 +313,7 @@ Section: Week 5
 
 - Your token gives read access to your Moodle account. Keep it in environment variables or GitHub Secrets, never in code, issues or screenshots.
 - If a token is exposed, revoke it under **Preferences → User account → Security keys** and generate a new one.
+- Token renewal over Telegram only works for the Telegram user ID you configure, only in a private chat, and the token is stored encrypted. Keep `TOKEN_ENCRYPTION_KEY` as a secret and never commit it.
 - `.gitignore` excludes `.env` and `*.db`. Check `git status` before your first push.
 - The bot is read-only and polls gently. Keep it that way, and if you ever share it with other people, store their tokens encrypted and tell your institution.
 - Telegram alerts contain course names, deadlines and snippets of announcements. In a group chat, everyone in the group can read them.
@@ -290,7 +325,9 @@ Section: Week 5
 | `enablewsdisabled` / `servicenotavailable` | The site admin disabled the mobile web service. This bot can't work on that site. |
 | `invalidlogin` when requesting a token | Wrong password, or you use SSO. Use the launch-URL method. |
 | Launch URL page is blank | Normal. Read the `moodlemobile://token=...` redirect from DevTools. Firefox is more reliable than Chrome for this. |
-| `invalidtoken` / "token expired" alert | Get a new token and update `MOODLE_TOKEN`. |
+| `invalidtoken` / "token expired" alert | Get a new token, then update `MOODLE_TOKEN` or send `/token ...` to the bot. |
+| `/token` gets no reply | It is applied at the next scheduled run (run the workflow manually to speed it up). Check that you're in a private chat, your user ID matches `TELEGRAM_ADMIN_ID`, and `TOKEN_ENCRYPTION_KEY` is set. |
+| `/token` says "Can't store a token yet" | `TOKEN_ENCRYPTION_KEY` is missing or malformed. Generate one with `--gen-key`. |
 | `invalidparameter` on forum discussions | Don't pass `sortby`/`sortdirection`. The bot uses the default ordering on Moodle 4.x. |
 | A function shows `SKIP` in `moodle_test.py` | That function isn't enabled for your account. The bot's other sources still work. |
 | Telegram test fails | Check the bot token and chat ID belong to the same bot, and that you've messaged the bot first. |

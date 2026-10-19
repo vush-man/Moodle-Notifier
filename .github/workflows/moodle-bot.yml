@@ -26,7 +26,6 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      # Restore the newest saved database (key prefix match picks the latest).
       - name: Restore state
         uses: actions/cache/restore@v5
         with:
@@ -42,9 +41,14 @@ jobs:
           MOODLE_TOKEN: ${{ secrets.MOODLE_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ADMIN_ID: ${{ secrets.TELEGRAM_ADMIN_ID }}
+          TOKEN_ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}
           SKIP_COURSE_IDS: ${{ vars.SKIP_COURSE_IDS }}
-
-      # Caches can't be overwritten, so each run saves under a new key.
+          TZ_OFFSET_MINUTES: ${{ vars.TZ_OFFSET_MINUTES }}
+          POLL_MINUTES: ${{ vars.POLL_MINUTES }}
+          REMINDER_HOURS: ${{ vars.REMINDER_HOURS }}
+          ASSIGN_REMINDER_HOURS: ${{ vars.ASSIGN_REMINDER_HOURS }}
+          
       - name: Save state
         if: always()
         uses: actions/cache/save@v5
