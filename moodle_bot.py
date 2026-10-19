@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Moodle -> Telegram notifier (read-only).
 
@@ -14,6 +15,9 @@ Usage:
   python moodle_bot.py                   # loop forever, every POLL_MINUTES
 
 Config comes from environment variables or a .env file (see .env.example).
+
+Layout: this file holds the Moodle logic (API client, state, checks, scheduling).
+Telegram delivery and message formatting live in telegram_notifier.py.
 """
 import argparse
 import base64
@@ -30,6 +34,8 @@ from pathlib import Path
 from urllib.parse import unquote
 
 import httpx
+
+from telegram_notifier import fmt, get_chat_id, make_notifier
 
 log = logging.getLogger("moodle-bot")
 
@@ -74,6 +80,12 @@ class Cfg:
         self.reminder_hours = sorted(
             int(x) for x in os.environ.get("REMINDER_HOURS", "24,3").split(",") if x.strip()
         )
+        # Reminders for assignments that are not submitted yet (hours before the deadline)
+        self.assign_reminder_hours = sorted(
+            int(x)
+            for x in (os.environ.get("ASSIGN_REMINDER_HOURS") or "48,24").split(",")
+            if x.strip()
+        )
         self.full_check_hours = int(os.environ.get("FULL_CHECK_HOURS", "3"))
         self.skip_courses = {
             int(x) for x in os.environ.get("SKIP_COURSE_IDS", "").split(",") if x.strip()
@@ -99,70 +111,29 @@ def short(s, n=60):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def fmt(title, body="", url=""):
-    body = (body or "").strip()
-    if len(body) > 700:
-        body = body[:700].rstrip() + "…"
-    parts = [f"<b>{html.escape(title)}</b>"]
-    if body:
-        parts.append(html.escape(body))
-    if url:
-        parts.append(html.escape(url))
-    return "\n".join(parts)
-
-
 def fmt_time(ts, tz):
     return datetime.fromtimestamp(ts, tz).strftime("%a %d %b, %I:%M %p")
 
 
-# --------------------------------------------------------------------------
-# Telegram
-# --------------------------------------------------------------------------
-def make_notifier(cfg):
-    def notify(text):
-        """Returns True if delivered (or printed when Telegram is not configured)."""
-        if not cfg.tg_token or not cfg.chat_id:
-            print("\n--- (Telegram not configured, printing) ---\n" + re.sub(r"</?b>", "", html.unescape(text)))
-            return True
-        for attempt in range(2):
-            try:
-                r = httpx.post(
-                    f"https://api.telegram.org/bot{cfg.tg_token}/sendMessage",
-                    data={
-                        "chat_id": cfg.chat_id,
-                        "text": text[:4000],
-                        "parse_mode": "HTML",
-                        "disable_web_page_preview": "true",
-                    },
-                    timeout=20,
-                )
-                if r.status_code == 200:
-                    return True
-                if r.status_code == 429:
-                    wait = r.json().get("parameters", {}).get("retry_after", 5)
-                    time.sleep(min(wait, 30))
-                    continue
-                log.error("Telegram error %s: %s", r.status_code, r.text[:200])
-                return False
-            except httpx.HTTPError as e:
-                log.error("Telegram network error: %s", e)
-                time.sleep(2)
-        return False
-
-    return notify
+def fmt_span(seconds):
+    """1 day 3 h / 5 h 20 min / 40 min"""
+    days, rem = divmod(int(seconds), 86400)
+    hours, rem = divmod(rem, 3600)
+    mins = rem // 60
+    if days:
+        return f"{days} day{'s' if days != 1 else ''} {hours} h"
+    if hours:
+        return f"{hours} h {mins} min"
+    return f"{max(mins, 1)} min"
 
 
-def get_chat_id(cfg):
-    r = httpx.get(f"https://api.telegram.org/bot{cfg.tg_token}/getUpdates", timeout=20)
-    data = r.json()
-    seen = set()
-    for u in data.get("result", []):
-        chat = (u.get("message") or u.get("my_chat_member") or {}).get("chat")
-        if chat and chat["id"] not in seen:
-            seen.add(chat["id"])
-            print(f"chat id: {chat['id']}  ({chat.get('first_name') or chat.get('title')})")
-    if not seen:
-        print("No messages found. Send any message to your bot in Telegram first, then re-run.")
+def time_left(due, now):
+    if not due:
+        return "no deadline set"
+    delta = due - now
+    if delta <= 0:
+        return f"OVERDUE by {fmt_span(-delta)}"
+    return fmt_span(delta)
 
 
 # --------------------------------------------------------------------------
@@ -252,8 +223,10 @@ def process(db, scope, items, notify):
     for fp, msg in items:
         if db.seen(fp):
             continue
-        if seeded and not notify(msg):
-            continue
+        if seeded:
+            text = msg() if callable(msg) else msg
+            if not notify(text):
+                continue
         db.add(fp)
     if not seeded:
         db.set(f"seeded:{scope}", "1")
@@ -263,7 +236,7 @@ def process(db, scope, items, notify):
 # --------------------------------------------------------------------------
 # Checks
 # --------------------------------------------------------------------------
-def check_deadlines(m, db, cfg, notify, now):
+def check_deadlines(m, db, cfg, notify, now, skip_assign=False):
     j = m.call(
         "core_calendar_get_action_events_by_timesort",
         timesortfrom=now - 3600,
@@ -271,7 +244,11 @@ def check_deadlines(m, db, cfg, notify, now):
         limitnum=50,  # Moodle rejects anything above 50
     )
     events = [
-        e for e in j.get("events", []) if (e.get("action") or {}).get("actionable", True)
+        e
+        for e in j.get("events", [])
+        if (e.get("action") or {}).get("actionable", True)
+        # assignments get their own richer handling in check_assignments()
+        and not (skip_assign and e.get("modulename") == "assign")
     ]
 
     items = []
@@ -301,6 +278,112 @@ def check_deadlines(m, db, cfg, notify, now):
                 body = f"{e.get('name', '')}\n{course}\nDue: {fmt_time(due, cfg.tz)}"
                 if not notify(fmt(f"⏰ Due in ~{left}", body, e.get("url", ""))):
                     continue
+            db.add(fp)
+
+
+STATUS_TEXT = {
+    "submitted": "✅ Submitted",
+    "draft": "📝 Draft saved, NOT submitted yet",
+    "new": "❌ Not submitted",
+    "reopened": "❌ Reopened, not submitted",
+    "unknown": "❓ Unknown",
+}
+
+
+def submission_state(m, assign_id, userid):
+    """Returns (status, can_submit, extension_due).
+    status is new / draft / submitted / reopened / unknown."""
+    try:
+        s = m.call("mod_assign_get_submission_status", assignid=assign_id, userid=userid)
+    except MoodleError:
+        return "unknown", None, 0
+    last = s.get("lastattempt") or {}
+    sub = last.get("teamsubmission") or last.get("submission") or {}
+    return (
+        sub.get("status", "new"),
+        last.get("submissionsenabled"),
+        int(last.get("extensionduedate") or 0),
+    )
+
+
+def assignment_message(cfg, a, cname, state, title):
+    status, _, ext = state
+    due = max(a.get("duedate") or 0, ext)
+    body = (
+        f"{strip_html(a.get('name', ''))}\n{cname}\n"
+        f"Deadline: {fmt_time(due, cfg.tz) if due else 'not set'}\n"
+        f"Time left: {time_left(due, time.time())}\n"
+        f"Status: {STATUS_TEXT.get(status, status)}"
+    )
+    url = f"{cfg.base}/mod/assign/view.php?id={a.get('cmid', '')}"
+    return fmt(title, body, url)
+
+
+def check_assignments(m, db, cfg, notify, courses, userid, now):
+    if not courses:
+        return
+    params = {f"courseids[{i}]": c["id"] for i, c in enumerate(courses)}
+    data = m.call("mod_assign_get_assignments", **params)
+    assigns = []
+    for co in data.get("courses", []):
+        cname = short(co.get("shortname") or co.get("fullname", ""))
+        for a in co.get("assignments", []):
+            assigns.append((cname, a))
+
+    # 1) new assignments and changed deadlines (message is built only when sent)
+    items = []
+    for cname, a in assigns:
+        due = a.get("duedate") or 0
+        fp = f"assign:{a['id']}:{due}"
+        title = (
+            "🔁 Assignment deadline changed"
+            if db.seen_prefix(f"assign:{a['id']}:")
+            else "📝 New assignment"
+        )
+        items.append(
+            (
+                fp,
+                lambda a=a, cname=cname, title=title: assignment_message(
+                    cfg, a, cname, submission_state(m, a["id"], userid), title
+                ),
+            )
+        )
+    process(db, "assignments", items, notify)
+
+    # 2) reminders, only while the assignment is NOT submitted yet.
+    # Only the tightest applicable window fires; larger ones are marked done.
+    windows = cfg.assign_reminder_hours
+    max_h = max(windows)
+    for cname, a in assigns:
+        due = a.get("duedate") or 0
+        hours_left = (due - now) / 3600
+        if not due or hours_left <= 0 or hours_left > max_h:
+            continue
+        fitting = [h for h in windows if hours_left <= h]
+        fps = {h: f"aremind:{a['id']}:{due}:{h}" for h in fitting}
+        if db.seen(fps[min(fitting)]):
+            continue  # already reminded for this window, no API call needed
+
+        state = submission_state(m, a["id"], userid)
+        status, can_submit, ext = state
+        eff_due = max(due, ext)
+        if eff_due != due:  # you were granted an extension: judge by that deadline
+            hours_left = (eff_due - now) / 3600
+            if hours_left <= 0 or hours_left > max_h:
+                continue
+            fitting = [h for h in windows if hours_left <= h]
+            fps = {h: f"aremind:{a['id']}:{eff_due}:{h}" for h in fitting}
+            if db.seen(fps[min(fitting)]):
+                continue
+        if status == "submitted" or can_submit is False:
+            for fp in fps.values():  # nothing to remind about
+                db.add(fp)
+            continue
+
+        title = f"⏰ Assignment due in {fmt_span(eff_due - now)}"
+        if not notify(assignment_message(cfg, a, cname, state, title)):
+            continue  # retry next run
+        for fp in fps.values():
             db.add(fp)
 
 
@@ -358,6 +441,8 @@ def check_materials(m, db, cfg, notify, courses, now):
                     for mod in sec.get("modules", []):
                         if mod.get("uservisible") is False:
                             continue
+                        if mod.get("modname") == "assign":
+                            continue  # handled by check_assignments()
                         files = mod.get("contents") or []
                         tm = max((x.get("timemodified", 0) for x in files), default=0)
                         fp = f"module:{mod['id']}:{tm}"
@@ -415,7 +500,15 @@ def run_cycle(cfg, m, db, notify, userid):
     except Exception as e:
         errors.append(f"forums list: {e}")
 
-    step("deadlines", check_deadlines, m, db, cfg, notify, now)
+    assign_ok = []
+
+    def do_assignments():
+        check_assignments(m, db, cfg, notify, courses, userid, now)
+        assign_ok.append(True)
+
+    step("assignments", do_assignments)
+    # If the assignment check failed, let the generic deadline check cover them instead.
+    step("deadlines", check_deadlines, m, db, cfg, notify, now, bool(assign_ok))
     step("notifications", check_notifications, m, db, cfg, notify, userid)
     step("announcements", check_announcements, m, db, cfg, notify, news_forums, course_names)
     step("materials", check_materials, m, db, cfg, notify, courses, now)
@@ -469,14 +562,14 @@ def main():
     if args.get_chat_id:
         if not os.environ.get("TELEGRAM_BOT_TOKEN"):
             sys.exit("Set TELEGRAM_BOT_TOKEN first.")
-        get_chat_id(type("C", (), {"tg_token": os.environ["TELEGRAM_BOT_TOKEN"]})())
+        get_chat_id(os.environ["TELEGRAM_BOT_TOKEN"])
         return
 
     try:
         cfg = Cfg()
     except KeyError as e:
         sys.exit(f"Missing setting {e}. Copy .env.example to .env and fill it in.")
-    notify = make_notifier(cfg)
+    notify = make_notifier(cfg.tg_token, cfg.chat_id)
 
     if args.test_telegram:
         ok = notify(fmt("✅ Test message", "Telegram is wired up correctly."))

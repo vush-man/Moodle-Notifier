@@ -32,8 +32,9 @@ It talks to Moodle through the same **mobile web service API** the official Mood
 
 | Source | What you get |
 | --- | --- |
-| **Deadlines** | New or changed assignments and quizzes (next 90 days), already-completed ones are skipped |
-| **Deadline reminders** | Configurable reminders before the due time (default 24 h and 3 h) |
+| **Assignments** | A dedicated alert for each new assignment, or a changed deadline, showing the **deadline, time left and your submission status** (submitted / draft / not submitted) |
+| **Assignment reminders** | Reminders **2 days and 1 day** before the deadline (configurable), sent **only if you haven't submitted yet** |
+| **Other deadlines** | New or changed quizzes and other calendar deadlines (next 90 days), with reminders 24 h and 3 h before (completed ones are skipped) |
 | **Announcements** | New or edited posts in every course's announcements (news) forum |
 | **Course materials** | New or updated files, pages, links and folders in any of your courses |
 | **Notification bell** | The same notifications Moodle shows in the web UI |
@@ -155,7 +156,8 @@ Settings come from environment variables, or from a `.env` file in the working d
 | `TELEGRAM_BOT_TOKEN` | no* | | Bot token from @BotFather |
 | `TELEGRAM_CHAT_ID` | no* | | Chat to send alerts to |
 | `POLL_MINUTES` | no | `15` | Interval in loop mode (ignored with `--once`) |
-| `REMINDER_HOURS` | no | `24,3` | Reminder windows before a deadline, comma-separated |
+| `REMINDER_HOURS` | no | `24,3` | Reminder windows (hours before) for non-assignment deadlines such as quizzes |
+| `ASSIGN_REMINDER_HOURS` | no | `48,24` | Reminder windows (hours before) for assignments that are not submitted yet |
 | `FULL_CHECK_HOURS` | no | `3` | How often each course is fully rescanned as a safety net |
 | `SKIP_COURSE_IDS` | no | | Comma-separated course IDs to ignore |
 | `TZ_OFFSET_MINUTES` | no | `330` | Offset from UTC for displayed times (330 = India, IST) |
@@ -231,7 +233,9 @@ All calls are made to `/webservice/rest/server.php`. They are all read-only.
 | --- | --- |
 | `core_webservice_get_site_info` | Your user ID and the functions enabled for you |
 | `core_enrol_get_users_courses` | Your enrolled courses |
-| `core_calendar_get_action_events_by_timesort` | Upcoming assignment and quiz deadlines |
+| `core_calendar_get_action_events_by_timesort` | Upcoming quiz and other calendar deadlines |
+| `mod_assign_get_assignments` | Assignments, with their deadlines |
+| `mod_assign_get_submission_status` | Whether you've submitted (called only when needed) |
 | `message_popup_get_popup_notifications` | The notification bell |
 | `mod_forum_get_forums_by_courses` | Finding each course's announcements forum |
 | `mod_forum_get_forum_discussions` | Announcement posts |
@@ -243,6 +247,8 @@ Function availability differs between sites and versions. The notification bell 
 ## Behaviour details
 
 - **Seeding.** Each source and course is seeded silently the first time it's seen. A course you enrol in later is seeded without flooding you.
+- **Assignments vs materials.** Assignments are never reported as "new material". They have their own alert type and their own reminders. Calendar events for assignments are skipped by the generic deadline check, so you don't get duplicates. If the assignment check fails, the generic check covers them as a fallback.
+- **Assignment reminders.** Reminders only fire while the assignment is not submitted. A saved draft counts as not submitted. If you submit before a reminder is due, it is skipped silently. Submission status is only fetched once an assignment is inside its reminder window, to keep API calls low. If a deadline extension has been granted to you, it is used instead of the original date, as long as it was granted before the original deadline passed.
 - **Reminders.** For each deadline, only the tightest applicable window fires. A deadline first seen with 2 hours left gets one reminder, not both the 24 h and 3 h ones. Changing a due date resets its reminders.
 - **Completed work.** Events Moodle marks as not actionable, such as already submitted, are not reported.
 - **Ended courses.** Courses whose end date passed more than 7 days ago are skipped. Use `SKIP_COURSE_IDS` for others.
@@ -305,7 +311,8 @@ Section: Week 5
 
 ```
 moodle-notifier/
-├── moodle_bot.py                     # the bot
+├── moodle_bot.py                     # Moodle logic: API client, state, checks, scheduling, CLI
+├── telegram_notifier.py              # Telegram delivery + message formatting (no Moodle code)
 ├── moodle_test.py                    # optional: checks what your Moodle allows
 ├── requirements.txt
 ├── .env.example                      # config template (copy to .env, never commit .env)
@@ -314,6 +321,10 @@ moodle-notifier/
     └── workflows/
         └── moodle-bot.yml            # scheduled run + state caching
 ```
+
+### Swapping Telegram for something else
+
+`moodle_bot.py` only needs a `notify(text) -> bool` function (return `True` once the message is delivered, `False` to retry on the next run) and a `fmt(title, body, url)` helper. `telegram_notifier.py` provides both. To use another channel (Discord, email, ntfy...), write a module with the same two functions and change the import line at the top of `moodle_bot.py`.
 
 ## License
 
