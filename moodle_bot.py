@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Moodle -> Telegram notifier (read-only).
 
@@ -697,6 +696,21 @@ def handle_telegram_commands(cfg, db):
         finish("✅ Moodle token updated", "It will be used from the next check. Your message was deleted.")
 
 
+def make_admin_notifier(cfg, notify):
+    """Operational alerts (like an expired token) go to the admin's private chat, so
+    group members don't see them. A private chat id equals the user's id. Falls back
+    to the normal chat if the admin can't be reached (e.g. they never pressed Start)."""
+
+    def notify_admin(text):
+        if cfg.tg_token and cfg.tg_admin_id:
+            if send_message(cfg.tg_token, cfg.tg_admin_id, text):
+                return True
+            log.warning("Could not reach the admin privately; using the main chat instead")
+        return notify(text)
+
+    return notify_admin
+
+
 def token_alert(cfg, db, notify, msg):
     last = int(db.get("token_alert_ts") or 0)
     if time.time() - last > 86400:
@@ -759,6 +773,7 @@ def main():
     except ValueError as e:
         sys.exit(f"Bad setting: {e}")
     notify = make_notifier(cfg.tg_token, cfg.chat_id)
+    notify_admin = make_admin_notifier(cfg, notify)
 
     if args.test_telegram:
         ok = notify(fmt("✅ Test message", "Telegram is wired up correctly."))
@@ -780,7 +795,7 @@ def main():
             run_cycle(cfg, m, db, notify, userid)
         except TokenExpired as e:
             log.error("Token expired: %s", e)
-            token_alert(cfg, db, notify, str(e))
+            token_alert(cfg, db, notify_admin, str(e))
         except Exception:
             log.exception("Cycle failed")
         if args.once:

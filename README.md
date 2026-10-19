@@ -287,7 +287,7 @@ Function availability differs between sites and versions. The notification bell 
 - **Completed work.** Events Moodle marks as not actionable, such as already submitted, are not reported.
 - **Ended courses.** Courses whose end date passed more than 7 days ago are skipped. Use `SKIP_COURSE_IDS` for others.
 - **Hidden content.** Items you can't see (hidden or restricted) aren't reported until they become visible to you, at which point they count as new.
-- **Failure handling.** An expired token triggers a Telegram alert (at most once a day) and the run stops. Other errors are logged, and three consecutive failing runs trigger a warning.
+- **Failure handling.** An expired token triggers a Telegram alert (at most once a day) and the run stops. The alert goes to your private chat with the bot (`TELEGRAM_ADMIN_ID`) rather than the group, and falls back to the main chat if the bot can't message you privately. Other errors are logged, and three consecutive failing runs trigger a warning.
 
 Example messages:
 
