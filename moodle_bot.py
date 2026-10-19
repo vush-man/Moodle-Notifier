@@ -61,7 +61,9 @@ def load_env(path=".env"):
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        v = v.strip().strip('"').strip("'")
+        if v:  # a blank value means "not set"
+            os.environ.setdefault(k.strip(), v)
 
 
 def parse_token(value):
@@ -78,41 +80,61 @@ def parse_token(value):
     return parts[1]
 
 
+def env(name, default=""):
+    """Read a setting. Empty or blank counts as "not set": GitHub Actions passes
+    undefined secrets and variables to the program as empty strings."""
+    value = os.environ.get(name)
+    return value.strip() if value and value.strip() else default
+
+
+def env_int(name, default):
+    value = env(name, str(default))
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a whole number, got {value!r}") from None
+
+
+def env_int_list(name, default):
+    value = env(name, default)
+    try:
+        return sorted(int(x) for x in value.split(",") if x.strip())
+    except ValueError:
+        raise ValueError(f"{name} must be comma-separated whole numbers, got {value!r}") from None
+
+
 class Cfg:
     def __init__(self):
-        self.base = os.environ["MOODLE_URL"].rstrip("/")
-        self.token = parse_token(os.environ["MOODLE_TOKEN"])
-        self.tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-        self.chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+        self.base = env("MOODLE_URL").rstrip("/")
+        if not self.base:
+            raise KeyError("MOODLE_URL")
+        raw_token = env("MOODLE_TOKEN")
+        if not raw_token:
+            raise KeyError("MOODLE_TOKEN")
+        self.token = parse_token(raw_token)
+        self.tg_token = env("TELEGRAM_BOT_TOKEN")
+        self.chat_id = env("TELEGRAM_CHAT_ID")
         # Only this Telegram user may send commands (like /token) to the bot.
         # Defaults to TELEGRAM_CHAT_ID when that is a private chat (a private chat id
         # equals the user id). For a group chat you must set TELEGRAM_ADMIN_ID.
-        raw_admin = os.environ.get("TELEGRAM_ADMIN_ID", "").strip()
+        raw_admin = env("TELEGRAM_ADMIN_ID")
         if raw_admin.lstrip("-").isdigit():
             self.tg_admin_id = int(raw_admin)
-        elif self.chat_id.strip().isdigit():
+        elif self.chat_id.isdigit():
             self.tg_admin_id = int(self.chat_id)
         else:
             self.tg_admin_id = None
         # Key used to encrypt a token received over Telegram before it is stored.
-        self.token_key = os.environ.get("TOKEN_ENCRYPTION_KEY", "").strip()
-        self.poll_minutes = int(os.environ.get("POLL_MINUTES", "15"))
-        self.db_path = os.environ.get("DB_PATH", "moodle_bot.db")
-        self.reminder_hours = sorted(
-            int(x) for x in os.environ.get("REMINDER_HOURS", "24,3").split(",") if x.strip()
-        )
+        self.token_key = env("TOKEN_ENCRYPTION_KEY")
+        self.poll_minutes = env_int("POLL_MINUTES", 15)
+        self.db_path = env("DB_PATH", "moodle_bot.db")
+        self.reminder_hours = env_int_list("REMINDER_HOURS", "24,3")
         # Reminders for assignments that are not submitted yet (hours before the deadline)
-        self.assign_reminder_hours = sorted(
-            int(x)
-            for x in (os.environ.get("ASSIGN_REMINDER_HOURS") or "48,24").split(",")
-            if x.strip()
-        )
-        self.full_check_hours = int(os.environ.get("FULL_CHECK_HOURS", "3"))
-        self.skip_courses = {
-            int(x) for x in os.environ.get("SKIP_COURSE_IDS", "").split(",") if x.strip()
-        }
+        self.assign_reminder_hours = env_int_list("ASSIGN_REMINDER_HOURS", "48,24")
+        self.full_check_hours = env_int("FULL_CHECK_HOURS", 3)
+        self.skip_courses = set(env_int_list("SKIP_COURSE_IDS", ""))
         # India Standard Time by default (UTC+5:30)
-        self.tz = timezone(timedelta(minutes=int(os.environ.get("TZ_OFFSET_MINUTES", "330"))))
+        self.tz = timezone(timedelta(minutes=env_int("TZ_OFFSET_MINUTES", 330)))
 
 
 # --------------------------------------------------------------------------
@@ -730,7 +752,12 @@ def main():
     try:
         cfg = Cfg()
     except KeyError as e:
-        sys.exit(f"Missing setting {e}. Copy .env.example to .env and fill it in.")
+        sys.exit(
+            f"Missing setting {e}. Set it as an environment variable (a GitHub secret "
+            "on Actions), or put it in a .env file (see .env.example)."
+        )
+    except ValueError as e:
+        sys.exit(f"Bad setting: {e}")
     notify = make_notifier(cfg.tg_token, cfg.chat_id)
 
     if args.test_telegram:
