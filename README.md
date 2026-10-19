@@ -353,6 +353,7 @@ moodle-notifier/
 ├── moodle_test.py                    # optional: checks what your Moodle allows
 ├── requirements.txt
 ├── .env.example                      # config template (copy to .env, never commit .env)
+├── LICENSE
 ├── .gitignore
 └── .github/
     └── workflows/
@@ -365,4 +366,5 @@ moodle-notifier/
 
 ## License
 
-Add the license of your choice (for example MIT) as a `LICENSE` file.
+This project is licensed under the MIT License.
+You are free to use, modify, and distribute this project, subject to the terms of the license.
