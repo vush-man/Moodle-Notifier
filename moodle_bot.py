@@ -128,7 +128,8 @@ class Cfg:
         self.poll_minutes = env_int("POLL_MINUTES", 15)
         self.db_path = env("DB_PATH", "moodle_bot.db")
         self.reminder_hours = env_int_list("REMINDER_HOURS", "24,3")
-        # Reminders for assignments that are not submitted yet (hours before the deadline)
+        # Assignment reminders, in hours before the deadline. Sent regardless of whether
+        # you have submitted: the bot never checks submission status.
         self.assign_reminder_hours = env_int_list("ASSIGN_REMINDER_HOURS", "48,24")
         self.full_check_hours = env_int("FULL_CHECK_HOURS", 3)
         self.skip_courses = set(env_int_list("SKIP_COURSE_IDS", ""))
@@ -323,45 +324,18 @@ def check_deadlines(m, db, cfg, notify, now, skip_assign=False):
             db.add(fp)
 
 
-STATUS_TEXT = {
-    "submitted": "✅ Submitted",
-    "draft": "📝 Draft saved, NOT submitted yet",
-    "new": "❌ Not submitted",
-    "reopened": "❌ Reopened, not submitted",
-    "unknown": "❓ Unknown",
-}
-
-
-def submission_state(m, assign_id, userid):
-    """Returns (status, can_submit, extension_due).
-    status is new / draft / submitted / reopened / unknown."""
-    try:
-        s = m.call("mod_assign_get_submission_status", assignid=assign_id, userid=userid)
-    except MoodleError:
-        return "unknown", None, 0
-    last = s.get("lastattempt") or {}
-    sub = last.get("teamsubmission") or last.get("submission") or {}
-    return (
-        sub.get("status", "new"),
-        last.get("submissionsenabled"),
-        int(last.get("extensionduedate") or 0),
-    )
-
-
-def assignment_message(cfg, a, cname, state, title):
-    status, _, ext = state
-    due = max(a.get("duedate") or 0, ext)
+def assignment_message(cfg, a, cname, title):
+    due = a.get("duedate") or 0
     body = (
         f"{strip_html(a.get('name', ''))}\n{cname}\n"
         f"Deadline: {fmt_time(due, cfg.tz) if due else 'not set'}\n"
-        f"Time left: {time_left(due, time.time())}\n"
-        f"Status: {STATUS_TEXT.get(status, status)}"
+        f"Time left: {time_left(due, time.time())}"
     )
     url = f"{cfg.base}/mod/assign/view.php?id={a.get('cmid', '')}"
     return fmt(title, body, url)
 
 
-def check_assignments(m, db, cfg, notify, courses, userid, now):
+def check_assignments(m, db, cfg, notify, courses, now):
     if not courses:
         return
     params = {f"courseids[{i}]": c["id"] for i, c in enumerate(courses)}
@@ -372,7 +346,7 @@ def check_assignments(m, db, cfg, notify, courses, userid, now):
         for a in co.get("assignments", []):
             assigns.append((cname, a))
 
-    # 1) new assignments and changed deadlines (message is built only when sent)
+    # 1) new assignments and changed deadlines
     items = []
     for cname, a in assigns:
         due = a.get("duedate") or 0
@@ -382,17 +356,11 @@ def check_assignments(m, db, cfg, notify, courses, userid, now):
             if db.seen_prefix(f"assign:{a['id']}:")
             else "📝 New assignment"
         )
-        items.append(
-            (
-                fp,
-                lambda a=a, cname=cname, title=title: assignment_message(
-                    cfg, a, cname, submission_state(m, a["id"], userid), title
-                ),
-            )
-        )
+        items.append((fp, assignment_message(cfg, a, cname, title)))
     process(db, "assignments", items, notify)
 
-    # 2) reminders, only while the assignment is NOT submitted yet.
+    # 2) deadline reminders (default: 2 days and 1 day before). They are sent whether or
+    # not you have submitted: the bot never looks at submission status.
     # Only the tightest applicable window fires; larger ones are marked done.
     windows = cfg.assign_reminder_hours
     max_h = max(windows)
@@ -404,26 +372,9 @@ def check_assignments(m, db, cfg, notify, courses, userid, now):
         fitting = [h for h in windows if hours_left <= h]
         fps = {h: f"aremind:{a['id']}:{due}:{h}" for h in fitting}
         if db.seen(fps[min(fitting)]):
-            continue  # already reminded for this window, no API call needed
-
-        state = submission_state(m, a["id"], userid)
-        status, can_submit, ext = state
-        eff_due = max(due, ext)
-        if eff_due != due:  # you were granted an extension: judge by that deadline
-            hours_left = (eff_due - now) / 3600
-            if hours_left <= 0 or hours_left > max_h:
-                continue
-            fitting = [h for h in windows if hours_left <= h]
-            fps = {h: f"aremind:{a['id']}:{eff_due}:{h}" for h in fitting}
-            if db.seen(fps[min(fitting)]):
-                continue
-        if status == "submitted" or can_submit is False:
-            for fp in fps.values():  # nothing to remind about
-                db.add(fp)
-            continue
-
-        title = f"⏰ Assignment due in {fmt_span(eff_due - now)}"
-        if not notify(assignment_message(cfg, a, cname, state, title)):
+            continue  # already reminded for this window
+        title = f"⏰ Assignment due in {fmt_span(due - now)}"
+        if not notify(assignment_message(cfg, a, cname, title)):
             continue  # retry next run
         for fp in fps.values():
             db.add(fp)
@@ -545,7 +496,7 @@ def run_cycle(cfg, m, db, notify, userid):
     assign_ok = []
 
     def do_assignments():
-        check_assignments(m, db, cfg, notify, courses, userid, now)
+        check_assignments(m, db, cfg, notify, courses, now)
         assign_ok.append(True)
 
     step("assignments", do_assignments)
