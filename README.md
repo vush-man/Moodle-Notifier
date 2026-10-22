@@ -1,244 +1,235 @@
 # Moodle Notifier
 
-A small, read-only bot that watches your Moodle account and sends you **Telegram** messages for new deadlines, announcements, course materials and Moodle notifications, so you stop missing quizzes and assignments when Moodle's own emails and push notifications don't arrive.
+**Never miss a Moodle deadline again.** Moodle Notifier is a read-only Python bot that watches your Moodle courses and sends timely alerts to Telegram when assignments, quizzes, announcements, course materials, or Moodle notifications change.
 
-It talks to Moodle through the same **mobile web service API** the official Moodle app uses, so it needs no browser automation and no admin access. It runs happily on a free **GitHub Actions** schedule.
+It uses Moodle's mobile web-service API — no browser automation, no admin access, and no always-on server required. Run it locally, on a VPS, or on a scheduled GitHub Actions workflow.
 
-> Unofficial project. Not affiliated with or endorsed by Moodle or any university. Use it only with your own account and in line with your institution's rules.
+<p align="center">
+  <strong>Deadlines · Reminders · Announcements · Course materials · Telegram</strong>
+</p>
 
----
-
-## Table of contents
-
-- [Features](#features)
-- [How it works](#how-it-works)
-- [Requirements](#requirements)
-- [Quick start (local)](#quick-start-local)
-- [Getting a Moodle token](#getting-a-moodle-token)
-- [Setting up Telegram](#setting-up-telegram)
-- [Configuration](#configuration)
-- [Deploying on GitHub Actions](#deploying-on-github-actions)
-- [Checking your Moodle supports it](#checking-your-moodle-supports-it)
-- [Moodle API functions used](#moodle-api-functions-used)
-- [Behaviour details](#behaviour-details)
-- [Security notes](#security-notes)
-- [Troubleshooting](#troubleshooting)
-- [Limitations](#limitations)
-- [Project structure](#project-structure)
+> **Unofficial project:** Moodle Notifier is not affiliated with or endorsed by Moodle or any university. Use it only with your own account and in accordance with your institution's rules.
 
 ---
+
+## At a glance
+
+- **Deadline alerts** for new assignments and changed due dates, with time remaining.
+- **Configurable reminders** before assignment deadlines, quizzes, and other calendar events.
+- **Course updates** for announcements and new or edited resources.
+- **Telegram delivery** with optional token-expiry and repeated-failure alerts.
+- **Stateful, low-noise checks** that avoid re-alerting for everything on every run.
+- **Read-only by design:** it does not submit work, mark activities, or change Moodle data.
+- **Flexible hosting:** run it on your machine, a VPS, or GitHub Actions.
 
 ## Features
 
 | Source | What you get |
 | --- | --- |
-| **Assignments** | A dedicated alert for each new assignment, or a changed deadline, showing the **deadline and time left** |
-| **Assignment reminders** | Reminders **2 days and 1 day** before the deadline (configurable). They are sent **regardless of submission status**: the bot never checks it |
-| **Other deadlines** | New or changed quizzes and other calendar deadlines (next 90 days), with reminders 24 h and 3 h before (completed ones are skipped) |
-| **Announcements** | New or edited posts in every course's announcements (news) forum |
-| **Course materials** | New or updated files, pages, links and folders in any of your courses |
-| **Notification bell** | The same notifications Moodle shows in the web UI |
-| **Health alerts** | A Telegram message if your token expires, or if the bot fails several runs in a row |
-| **Token renewal** | Optional: send `/token ...` to the bot in a private chat to replace an expired Moodle token, stored encrypted |
+| **Assignments** | A dedicated alert for each new assignment or changed deadline, showing the due date and time left |
+| **Assignment reminders** | Default reminders 48 and 24 hours before the deadline; sent regardless of submission status |
+| **Other deadlines** | New or changed quizzes and calendar deadlines in the next 90 days; default reminders 24 and 3 hours before |
+| **Announcements** | Alerts for new or edited posts in course announcement/news forums |
+| **Course materials** | Alerts for new or updated files, pages, links, and folders |
+| **Moodle notifications** | Checks the notification bell exposed by your Moodle site |
+| **Health alerts** | Alerts for expired tokens or several failed runs in a row |
+| **Token renewal (optional)** | Renew a Moodle token through a private Telegram chat, with encrypted storage |
 
-Other design points:
+### Design principles
 
-- **Read-only.** The bot only calls Moodle functions that read data. It never writes, submits or marks anything.
-- **No spam on first run.** The first run stores everything that already exists silently, and only *new* things notify you afterwards.
-- **Safe retries.** An item is only marked as seen after Telegram accepts the message, so a failed delivery is retried on the next run.
-- **Polite polling.** Cheap "what changed?" checks first, full scans only when needed, short pauses between calls.
-- **Runs anywhere.** A local machine, a VPS, or scheduled GitHub Actions.
+- **Quiet first run:** existing items are recorded silently; notifications start with later changes.
+- **Delivery-aware retries:** an item is marked as seen only after Telegram accepts the message.
+- **Polite polling:** lightweight change checks come first, with full course scans as needed and a periodic safety net.
+- **Portable state:** SQLite tracks previously seen items and timestamps.
+- **No submission tracking:** assignment reminders are sent regardless of whether you submitted.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    A[Scheduler<br/>cron / Actions / loop] --> B[moodle_bot.py]
-    B -->|REST calls with token| C[(Moodle<br/>web service)]
-    B <-->|seen items, timestamps| D[(SQLite state)]
-    B -->|new items only| E[Telegram bot]
+    A[Scheduler: local loop / cron / GitHub Actions] --> B[moodle_bot.py]
+    B -->|Read-only API calls| C[(Moodle web service)]
+    B <-->|Fingerprints and timestamps| D[(SQLite state)]
+    B -->|New alerts only| E[Telegram bot]
     E --> F[Your phone]
 ```
 
-Each run:
-
-1. Looks up your user and your enrolled courses (courses that ended more than a week ago are skipped).
-2. Checks **deadlines** and sends reminders for those coming due.
-3. Checks the **notification bell**.
-4. Checks each course's **announcements forum**.
-5. For each course, asks Moodle *"has anything changed since I last looked?"*. A full contents scan only happens if so, plus a safety-net scan every few hours.
-6. Compares everything against the state database and sends Telegram messages for anything it hasn't seen.
-
-Every item gets a fingerprint, such as `announce:<discussion id>:<time modified>` or `module:<module id>:<file time modified>`. A new ID means something new appeared, and a changed timestamp means something was edited or re-uploaded.
+Each run looks up your enrolled courses, checks upcoming deadlines, checks the Moodle notification bell and announcement forums, and detects course-content changes. It compares items with the local SQLite state and sends alerts for new or changed items.
 
 ## Requirements
 
-- Python 3.9+ (3.12 recommended)
-- A Moodle site (tested against Moodle 4.5) with the **mobile web service enabled**
-- A Telegram account
-- `httpx` and `cryptography` (see `requirements.txt`; `cryptography` is only used for token renewal over Telegram)
+- Python 3.9+ (Python 3.12 recommended)
+- A Moodle site with the **mobile web service** enabled (tested with Moodle 4.5)
+- A Telegram account and bot (optional for terminal-only testing)
+- Dependencies from `requirements.txt` (`cryptography` is used for optional Telegram token renewal)
 
-## Quick start (local)
+## Quick start
+
+### 1. Clone and install
 
 ```bash
 git clone https://github.com/vush-man/Moodle-Notifier.git
-cd moodle-notifier
-python -m venv venv
-# Windows: venv\Scripts\activate      macOS/Linux: source venv/bin/activate
-pip install -r requirements.txt
+cd Moodle-Notifier
+python -m venv .venv
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+# macOS / Linux
+source .venv/bin/activate
 
-cp .env.example .env      # then fill it in (see Configuration)
-
-python moodle_bot.py --test-telegram   # should send a test message to your phone
-python moodle_bot.py --once            # first run: seeds silently, sends one "bot is running" message
-python moodle_bot.py                   # keep running, checking every POLL_MINUTES
+python -m pip install -r requirements.txt
 ```
 
-If Telegram settings are left empty, notifications are printed to the terminal instead, which is handy for a dry run.
+### 2. Configure the environment
+
+Copy the example file and add your Moodle settings:
+
+```bash
+# macOS / Linux
+cp .env.example .env
+# Windows PowerShell
+Copy-Item .env.example .env
+```
+
+Open `.env` and set `MOODLE_URL` and `MOODLE_TOKEN`. To receive Telegram alerts, also set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`.
+
+### 3. Test and run
+
+```bash
+python moodle_bot.py --test-telegram
+python moodle_bot.py --once
+python moodle_bot.py
+```
+
+The first `--once` run seeds existing items quietly and sends a single “bot is running” message. Without Telegram settings, alerts are printed in the terminal.
 
 ### Command-line options
 
 | Option | Purpose |
 | --- | --- |
-| `--once` | Run one check and exit (used by GitHub Actions and cron) |
-| `--test-telegram` | Send a test message and exit |
-| `--get-chat-id` | Print the chat IDs your Telegram bot has seen |
-| `--gen-key` | Print a new `TOKEN_ENCRYPTION_KEY` |
-| `-v`, `--verbose` | Debug logging |
+| `--once` | Run a single check and exit (useful for Actions or cron) |
+| `--test-telegram` | Send a Telegram test message |
+| `--get-chat-id` | Show chat IDs the bot has seen |
+| `--gen-key` | Generate a `TOKEN_ENCRYPTION_KEY` for token renewal |
+| `-v`, `--verbose` | Enable debug logging |
 
 ## Getting a Moodle token
 
-The token is what the bot uses instead of your password. **Treat it like a password.**
+The bot uses a Moodle web-service token instead of your password. **Treat the token like a password. Never publish it, commit it, or share it in an issue or screenshot.**
 
-### If you log in with a Moodle username and password
+### Username and password login
+
+If your Moodle site permits password-based token creation, run this with your site's URL and credentials:
 
 ```bash
 curl -X POST "https://YOUR-MOODLE-URL/login/token.php" \
-  -d "username=YOUR_USER" -d "password=YOUR_PASS" -d "service=moodle_mobile_app"
+  -d "username=YOUR_USER" \
+  -d "password=YOUR_PASS" \
+  -d "service=moodle_mobile_app"
 ```
 
-A response like `{"token":"..."}` is your token. An error such as `enablewsdisabled` or `servicenotavailable` means the site admin has turned the mobile service off.
+A successful response contains a token. Errors such as `enablewsdisabled` or `servicenotavailable` usually mean the mobile service is disabled for your site.
 
-### If you log in with SSO (Microsoft, Google, CAS...)
+### Single sign-on (SSO)
 
-SSO accounts have no Moodle password, so use the same launch flow as the mobile app:
+For Microsoft, Google, CAS, or other SSO logins, follow the mobile-app launch flow:
 
-1. Log in to Moodle in a desktop browser. Open DevTools (F12) and go to the **Network** tab with **Preserve log** ticked.
-2. In the same tab open:
+1. Sign in to Moodle in a desktop browser and open DevTools (**F12 → Network**). Enable **Preserve log**.
+2. In the same browser session, open:
    ```
    https://YOUR-MOODLE-URL/admin/tool/mobile/launch.php?service=moodle_mobile_app&passport=12345&urlscheme=moodlemobile
    ```
-3. The page will look blank or fail, which is expected. The browser can't open the `moodlemobile://` address it is redirected to. In the Network tab, find the request whose URL starts with `moodlemobile://token=...` (or the `launch.php` request and its `Location` response header) and copy the whole string.
-4. Put that string in `MOODLE_TOKEN`. The bot accepts either the raw 32-character token or the full `moodlemobile://token=...` string.
+3. Inspect the redirect in the Network panel. Look for a `moodlemobile://token=...` URL or the `Location` response header on the launch request.
+4. Put the token (or full `moodlemobile://token=...` string) in `MOODLE_TOKEN`.
 
-If your browser hides the redirect, copy your `MoodleSession` cookie and run
-`curl -i -H "Cookie: MoodleSession=VALUE" "<the launch URL>"`, then read the `location:` header. Don't share that cookie with anyone.
+If the token redirect is difficult to inspect, use the optional diagnostic guidance in the project and keep session cookies private. Never send your Moodle session cookie to anyone.
 
-### Token lifetime
+### Token expiry and renewal
 
-Tokens expire on a schedule set by your site admin. Check **Profile → Preferences → User account → Security keys** for the "Moodle mobile web service" key and its valid-until date. When the token expires the bot sends you a Telegram alert (at most once a day). Repeat the steps above and update `MOODLE_TOKEN`, or send it to the bot (see below).
+Token lifetime is controlled by your Moodle administrator. You can check **Profile → Preferences → User account → Security keys** for the mobile web-service key and its expiry date. If it expires, the bot can alert you; update the `MOODLE_TOKEN` secret or use the optional Telegram renewal flow below.
 
-### Renewing the token from Telegram (optional)
+#### Optional: renew through Telegram
 
-Instead of editing the GitHub secret by hand, send the new token to the bot from your phone. The bot checks it with Moodle, stores it **encrypted**, deletes your message and confirms.
+1. Generate a key with `python moodle_bot.py --gen-key` and save it as the repository secret `TOKEN_ENCRYPTION_KEY`.
+2. If alerts go to a group, set `TELEGRAM_ADMIN_ID` to your own Telegram user ID.
+3. In a **private chat** with your bot, send `/token moodlemobile://token=...` (or paste the bare token).
+4. The bot validates the token, stores it encrypted, deletes the incoming message, and confirms the update.
 
-**One-time setup**
+The new token is picked up on the next run; manually trigger the workflow if you want to apply it sooner.
 
-1. Generate an encryption key: `python moodle_bot.py --gen-key`. Save the output as a repository secret named `TOKEN_ENCRYPTION_KEY`. Keep a copy somewhere safe.
-2. If `TELEGRAM_CHAT_ID` is a **group**, also add a secret `TELEGRAM_ADMIN_ID` with your own Telegram user ID. Message the bot privately, run `python moodle_bot.py --get-chat-id`, and use the number for your private chat. (If `TELEGRAM_CHAT_ID` is already your private chat, this is automatic.)
-
-**Renewing**
-
-1. Get a token as described above (the `moodlemobile://token=...` string).
-2. Open a **private chat** with your bot and send `/token moodlemobile://token=...`. Pasting the bare string also works.
-3. You'll get a confirmation. The new token is used from the next run, which can take up to 15 to 30 minutes on GitHub's schedule. To apply it immediately, run the workflow manually from the Actions tab.
-
-**How it's protected**
-
-- Only your Telegram user ID can send commands, and only in a private chat. Messages from anyone else are ignored without a reply.
-- The token is verified against Moodle first, and must belong to the same Moodle account as before.
-- It is stored in the state database only in encrypted form. This matters on public repos, where Actions caches can be read by workflows triggered from forks. They can't read your secrets, so they can't decrypt it.
-- Your message is deleted right after processing. If you paste a token in a group by mistake, the bot warns you and you should reset it in Moodle.
-- If you later update the `MOODLE_TOKEN` secret by hand, the newer secret takes priority over the stored token.
-
-**Caveats**
-
-- The token passes through Telegram's servers. If you're not comfortable with that, update the GitHub secret instead.
-- Nothing else may read this bot's updates (`getUpdates`) or have a webhook set on it, or the two will conflict.
-- If you change `TOKEN_ENCRYPTION_KEY`, the stored token can't be decrypted and the bot falls back to `MOODLE_TOKEN`.
+**Security caveats:** the token passes through Telegram's servers. Only use this flow if you're comfortable with that. The bot must be the only consumer of that bot's updates (`getUpdates`) and must not conflict with an existing webhook. If you rotate `TOKEN_ENCRYPTION_KEY`, the stored token can no longer be decrypted, so the bot falls back to `MOODLE_TOKEN`.
 
 ## Setting up Telegram
 
-1. In Telegram, message **@BotFather**, send `/newbot`, and follow the prompts. Copy the bot token it gives you.
-2. Open a chat with your new bot and send it any message (for example `/start`).
-3. Run `python moodle_bot.py --get-chat-id` and copy the number it prints. That's your `TELEGRAM_CHAT_ID`.
-4. Run `python moodle_bot.py --test-telegram` to confirm it works.
+1. Message **@BotFather** on Telegram, run `/newbot`, and follow the prompts.
+2. Start a private chat with your new bot and send `/start` or any message.
+3. Set `TELEGRAM_BOT_TOKEN` in `.env` and run `python moodle_bot.py --get-chat-id`.
+4. Copy the relevant ID to `TELEGRAM_CHAT_ID`, then run `python moodle_bot.py --test-telegram`.
 
-**Group chats:** add the bot to the group, send a message that mentions it (for example `@YourBot hi`, since bots only see commands and mentions by default), then run `--get-chat-id` again. Group IDs are negative, often starting with `-100`; keep the minus sign. Everyone in the group will see every alert.
+For group alerts, add the bot to the group and mention it in a message before running `--get-chat-id` again. Group IDs are usually negative (often start with `-100`). Everyone in the group can see every alert.
 
 ## Configuration
 
-Settings come from environment variables, or from a `.env` file in the working directory.
+Settings can be provided as environment variables or through a local `.env` file.
 
 | Variable | Required | Default | Description |
 | --- | :---: | --- | --- |
-| `MOODLE_URL` | yes | | Base URL, e.g. `https://lms.example.edu` (no trailing slash) |
-| `MOODLE_TOKEN` | yes | | Raw token or `moodlemobile://token=...` string |
-| `TELEGRAM_BOT_TOKEN` | no* | | Bot token from @BotFather |
-| `TELEGRAM_CHAT_ID` | no* | | Chat to send alerts to |
-| `TELEGRAM_ADMIN_ID` | no | chat id if private | Your Telegram user ID: the only user allowed to send `/token`. Required if `TELEGRAM_CHAT_ID` is a group |
-| `TOKEN_ENCRYPTION_KEY` | no | | Enables `/token` renewal. Generate with `--gen-key` |
-| `POLL_MINUTES` | no | `15` | Interval in loop mode (ignored with `--once`) |
-| `REMINDER_HOURS` | no | `24,3` | Reminder windows (hours before) for non-assignment deadlines such as quizzes |
-| `ASSIGN_REMINDER_HOURS` | no | `48,24` | Reminder windows (hours before the deadline) for assignments |
-| `FULL_CHECK_HOURS` | no | `3` | How often each course is fully rescanned as a safety net |
-| `SKIP_COURSE_IDS` | no | | Comma-separated course IDs to ignore |
-| `TZ_OFFSET_MINUTES` | no | `330` | Offset from UTC for displayed times (330 = India, IST) |
-| `DB_PATH` | no | `moodle_bot.db` | Where the state database is stored |
+| `MOODLE_URL` | Yes | — | Base Moodle URL, without a trailing slash |
+| `MOODLE_TOKEN` | Yes | — | Raw token or `moodlemobile://token=...` string |
+| `TELEGRAM_BOT_TOKEN` | No* | — | Bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | No* | — | Private chat or group ID for alerts |
+| `TELEGRAM_ADMIN_ID` | No | Private chat ID | Telegram user ID allowed to renew the token; required for group destination |
+| `TOKEN_ENCRYPTION_KEY` | No | — | Enables encrypted token renewal; generate with `--gen-key` |
+| `POLL_MINUTES` | No | `15` | Interval in loop mode; ignored with `--once` |
+| `REMINDER_HOURS` | No | `24,3` | Reminder windows for non-assignment deadlines |
+| `ASSIGN_REMINDER_HOURS` | No | `48,24` | Assignment reminder windows |
+| `FULL_CHECK_HOURS` | No | `3` | Safety-net full course scan interval |
+| `SKIP_COURSE_IDS` | No | — | Comma-separated course IDs to ignore |
+| `TZ_OFFSET_MINUTES` | No | `330` | Display timezone offset in minutes (330 = India Standard Time) |
+| `DB_PATH` | No | `moodle_bot.db` | Path to the SQLite state database |
 
-\* Without Telegram settings the bot prints alerts to the terminal.
+\* Without Telegram settings, alerts are printed to the terminal.
 
-A template is provided as `.env.example`. **Never commit `.env`.**
+A template is included at `.env.example`. **Never commit your `.env` file.**
 
 ## Deploying on GitHub Actions
 
-This runs the bot for free on a schedule, with no server.
+GitHub Actions lets you run the bot on a schedule without keeping your own computer online.
 
-1. Create a new repository and push the project (the included `.gitignore` keeps `.env` and `*.db` out).
-2. In **Settings → Secrets and variables → Actions**, add these repository **secrets**:
-   `MOODLE_URL`, `MOODLE_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
-   Optional secrets: `TOKEN_ENCRYPTION_KEY` and `TELEGRAM_ADMIN_ID` (for [token renewal from Telegram](#renewing-the-token-from-telegram-optional)).
-   Optionally add a repository **variable** `SKIP_COURSE_IDS`.
-3. Open the **Actions** tab, choose **moodle-bot**, and click **Run workflow**.
+1. Open your repository and go to **Settings → Secrets and variables → Actions**.
+2. Add repository secrets: `MOODLE_URL`, `MOODLE_TOKEN`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID`.
+3. Optionally add `TOKEN_ENCRYPTION_KEY` and `TELEGRAM_ADMIN_ID` if using [Telegram token renewal](#optional-renew-through-telegram). You may also add `SKIP_COURSE_IDS` as a repository variable.
+4. Open **Actions**, select **moodle-bot**, and choose **Run workflow** to test it.
 
-How the workflow works (`.github/workflows/moodle-bot.yml`):
+The workflow is defined in `.github/workflows/moodle-bot.yml`. It runs `python moodle_bot.py --once` on a scheduled cron, uses `actions/cache` to preserve the SQLite state between fresh runners, and a concurrency group to prevent overlapping runs from racing on that state.
 
-- It runs `python moodle_bot.py --once` on a cron schedule at offset minutes (`:07, :22, :37, :52`), because GitHub delays or drops runs at the busy `:00/:15/:30/:45` marks.
-- A runner starts fresh every time, so the SQLite state file is saved and restored with `actions/cache`. Caches can't be overwritten, so each run saves under a unique key (`moodle-db-<run id>`) and the next run restores the newest one by prefix.
-- A `concurrency` group prevents two runs from overlapping and racing on the state.
+### Where state is stored
 
-**Where the state lives.** The state is a small SQLite file, `moodle_bot.db`, in the runner's working directory. It is **not** stored in your repository and is never committed. At the start of each run it is restored from the GitHub Actions cache, and at the end it is saved back. You can see the saved copies in your repo under **Actions → Caches**. The file holds only item fingerprints and timestamps, no message text. If you use token renewal over Telegram it also holds your Moodle token, but only in encrypted form. GitHub deletes caches that haven't been used for 7 days, so if the schedule is paused for longer than that, the next run starts from scratch and seeds silently. Anything posted during the gap won't be reported.
+The `moodle_bot.db` file stays in the runner's working directory; it is not committed to the repository. GitHub Actions cache restores it at the start of a run and saves it afterward. It contains item fingerprints and timestamps. If token renewal is enabled, it also contains the token in encrypted form.
 
-**Verify state persistence.** Run the workflow twice by hand. The first run should log `Seeded ... existing items` and send one "bot is running" message. The second run must **not** seed again. If it does, the state isn't being restored and every run would be treated as a first run.
+GitHub may evict caches that have not been used for a while. If the cache disappears, the next run may seed existing items again instead of notifying about changes that happened while state was missing.
 
-**Minutes and visibility.**
-- *Public repo:* free unlimited minutes, so the 15-minute schedule is fine. Secrets are never exposed, and GitHub masks them in logs, but the code and run logs are public.
-- *Private repo:* the free plan has a monthly minutes allowance, and a 15-minute schedule can exceed it. Switch to the commented 30-minute cron in the workflow, and check your plan's current allowance.
+### Check that state persistence works
 
-GitHub pauses scheduled workflows in repos with no activity for about 60 days. Push a small commit or re-enable the workflow if that happens. Scheduled runs can also start a few minutes late, which is fine for reminders measured in hours.
+Run the workflow manually twice. The first run should log that it seeded existing items; the second should not seed everything again. If it does, check the cache restore/save steps in the workflow logs.
 
-### Running on a server instead
+### Scheduling notes
 
-Any always-on Linux machine works. Run the loop mode under systemd:
+- GitHub Actions schedules are best-effort and may start late.
+- Public repositories have different Actions-minute treatment than private repositories; check GitHub's current usage rules for your plan.
+- Scheduled workflows may be disabled after long periods without repository activity, so check the Actions tab if runs unexpectedly stop.
+
+### Run on a server instead
+
+Any always-on Linux machine can run loop mode under a process manager such as systemd:
 
 ```ini
 [Unit]
-Description=Moodle notifier
+Description=Moodle Notifier
 After=network-online.target
 
 [Service]
-WorkingDirectory=/home/YOURUSER/moodle-notifier
-ExecStart=/home/YOURUSER/moodle-notifier/venv/bin/python moodle_bot.py
+WorkingDirectory=/home/YOURUSER/Moodle-Notifier
+ExecStart=/home/YOURUSER/Moodle-Notifier/.venv/bin/python moodle_bot.py
 Restart=always
 RestartSec=30
 User=YOURUSER
@@ -247,50 +238,50 @@ User=YOURUSER
 WantedBy=multi-user.target
 ```
 
-Keep `.env` readable only by that user (`chmod 600 .env`). Don't run the bot in two places at once with the same Telegram chat, because each copy has its own state and you will get duplicate alerts.
+Restrict access to `.env` (for example, `chmod 600 .env`). Avoid running multiple copies against the same Telegram destination, or duplicate alerts can occur.
 
-## Checking your Moodle supports it
+## Checking whether your Moodle supports it
 
-`moodle_test.py` is an optional read-only diagnostic. It gets a token (password login, `--token`, or `--sso`), lists which web service functions are enabled for your account, and live-tests each one the bot needs.
+Run the optional read-only diagnostic script to see which required web-service functions are enabled for your account:
 
 ```bash
 python moodle_test.py --url https://YOUR-MOODLE-URL --sso "moodlemobile://token=..."
 ```
 
-It prints `[ OK ]`, `[FAIL]` or `[SKIP]` per function and a summary. Run it before setting up the bot to see what your site allows.
+The script reports `[ OK ]`, `[FAIL]`, or `[SKIP]` per function and prints a summary. It supports password login, `--token`, or `--sso`; use its help output for the exact options available in your checkout.
 
 ## Moodle API functions used
 
-All calls are made to `/webservice/rest/server.php`. They are all read-only.
+All calls are made to `/webservice/rest/server.php` and are intended to be read-only.
 
-| Function | Used for |
+| Function | Purpose |
 | --- | --- |
-| `core_webservice_get_site_info` | Your user ID and the functions enabled for you |
-| `core_enrol_get_users_courses` | Your enrolled courses |
-| `core_calendar_get_action_events_by_timesort` | Upcoming quiz and other calendar deadlines |
-| `mod_assign_get_assignments` | Assignments, with their deadlines |
-| `message_popup_get_popup_notifications` | The notification bell |
-| `mod_forum_get_forums_by_courses` | Finding each course's announcements forum |
-| `mod_forum_get_forum_discussions` | Announcement posts |
-| `core_course_get_updates_since` | Cheap "anything changed?" check per course |
-| `core_course_get_contents` | Full course content snapshot for diffing |
+| `core_webservice_get_site_info` | Retrieve your user ID and available service information |
+| `core_enrol_get_users_courses` | List enrolled courses |
+| `core_calendar_get_action_events_by_timesort` | Retrieve upcoming calendar deadlines |
+| `mod_assign_get_assignments` | Retrieve assignment details and due dates |
+| `message_popup_get_popup_notifications` | Check Moodle notifications |
+| `mod_forum_get_forums_by_courses` | Find course announcement forums |
+| `mod_forum_get_forum_discussions` | Retrieve announcement posts |
+| `core_course_get_updates_since` | Check whether a course has changed |
+| `core_course_get_contents` | Retrieve course content for change detection |
 
-Function availability differs between sites and versions. The notification bell function, for example, appears under different names on some sites. If your site exposes it differently, `moodle_test.py` prints the notification-related functions that are enabled.
+Function availability varies across Moodle sites and versions. If a function is unavailable, the diagnostic script can help identify which notification-related functions your site exposes.
 
 ## Behaviour details
 
-- **Seeding.** Each source and course is seeded silently the first time it's seen. A course you enrol in later is seeded without flooding you.
-- **Assignments vs materials.** Assignments are never reported as "new material". They have their own alert type and their own reminders. Calendar events for assignments are skipped by the generic deadline check, so you don't get duplicates. If the assignment check fails, the generic check covers them as a fallback.
-- **Assignment reminders.** For each assignment with a deadline, you get a reminder 2 days and 1 day before it (`ASSIGN_REMINDER_HOURS`, default `48,24`). Submission status is never checked, so you still get the reminders after you've submitted, and no "submitted" message is ever sent. Only the tightest applicable window fires: an assignment first seen with 30 hours left gets one reminder, not two. Changing a deadline resets its reminders. Deadline extensions granted to you are not known to the bot, so reminders follow the assignment's original due date.
-- **Reminders.** For each deadline, only the tightest applicable window fires. A deadline first seen with 2 hours left gets one reminder, not both the 24 h and 3 h ones. Changing a due date resets its reminders.
-- **Completed work.** For quizzes and other calendar deadlines, events Moodle marks as not actionable (already done) are not reported. Assignments are the exception: they are handled separately and reminded about regardless.
-- **Ended courses.** Courses whose end date passed more than 7 days ago are skipped. Use `SKIP_COURSE_IDS` for others.
-- **Hidden content.** Items you can't see (hidden or restricted) aren't reported until they become visible to you, at which point they count as new.
-- **Failure handling.** An expired token triggers a Telegram alert (at most once a day) and the run stops. The alert goes to your private chat with the bot (`TELEGRAM_ADMIN_ID`) rather than the group, and falls back to the main chat if the bot can't message you privately. Other errors are logged, and three consecutive failing runs trigger a warning.
+- **First-seen items:** existing items are seeded silently. A course enrolled later is also seeded without a flood of alerts.
+- **Assignments vs. materials:** assignments have their own alerts and reminders instead of being reported as generic course materials. Calendar assignment events are skipped where possible to avoid duplicates; the generic deadline check is a fallback if assignment lookup fails.
+- **Assignment reminders:** defaults are 48 and 24 hours before the deadline. Submission status is not checked, so reminders may still arrive after submission. The bot does not send submission-status notifications. Only the tightest applicable reminder window fires; changing a due date resets the reminders. Extensions that Moodle does not expose to the bot may not be reflected.
+- **Other reminders:** only the tightest applicable reminder window fires. Changing a due date resets the reminder state.
+- **Completed work:** calendar events Moodle marks as no longer actionable are skipped; assignment handling is separate.
+- **Ended courses:** courses whose end date passed more than seven days ago are skipped.
+- **Hidden content:** resources that aren't visible to your account are not reported until they become visible.
+- **Failure handling:** expired tokens trigger an alert (at most once a day) and stop that run. Other errors are logged, and several consecutive failed runs trigger a warning.
 
-Example messages:
+### Example alerts
 
-```
+```text
 📅 New / changed deadline
 CSN304 AI Mini Project is due
 Due: Fri 24 Oct, 11:59 PM
@@ -310,60 +301,59 @@ Section: Week 5
 
 ## Security notes
 
-- Your token gives read access to your Moodle account. Keep it in environment variables or GitHub Secrets, never in code, issues or screenshots.
+- A Moodle token grants access to your account's exposed web services. Store it in environment variables or GitHub Secrets, never in source code, issues, screenshots, or logs.
 - If a token is exposed, revoke it under **Preferences → User account → Security keys** and generate a new one.
-- Token renewal over Telegram only works for the Telegram user ID you configure, only in a private chat, and the token is stored encrypted. Keep `TOKEN_ENCRYPTION_KEY` as a secret and never commit it.
-- `.gitignore` excludes `.env` and `*.db`. Check `git status` before your first push.
-- The bot is read-only and polls gently. Keep it that way, and if you ever share it with other people, store their tokens encrypted and tell your institution.
-- Telegram alerts contain course names, deadlines and snippets of announcements. In a group chat, everyone in the group can read them.
+- The optional Telegram renewal flow only accepts commands from the configured Telegram user in a private chat and stores the token encrypted.
+- `.gitignore` excludes `.env` and `*.db`; verify `git status` before pushing.
+- Telegram messages can contain course names, deadlines, and announcement snippets. Avoid group chats for private academic information.
+- Use the bot only with your own account and follow your institution's policies.
 
 ## Troubleshooting
 
-| Symptom | Likely cause and fix |
+| Symptom | Likely cause / fix |
 | --- | --- |
-| `enablewsdisabled` / `servicenotavailable` | The site admin disabled the mobile web service. This bot can't work on that site. |
-| `invalidlogin` when requesting a token | Wrong password, or you use SSO. Use the launch-URL method. |
-| Launch URL page is blank | Normal. Read the `moodlemobile://token=...` redirect from DevTools. Firefox is more reliable than Chrome for this. |
-| `invalidtoken` / "token expired" alert | Get a new token, then update `MOODLE_TOKEN` or send `/token ...` to the bot. |
-| `/token` gets no reply | It is applied at the next scheduled run (run the workflow manually to speed it up). Check that you're in a private chat, your user ID matches `TELEGRAM_ADMIN_ID`, and `TOKEN_ENCRYPTION_KEY` is set. |
-| `/token` says "Can't store a token yet" | `TOKEN_ENCRYPTION_KEY` is missing or malformed. Generate one with `--gen-key`. |
-| `invalidparameter` on forum discussions | Don't pass `sortby`/`sortdirection`. The bot uses the default ordering on Moodle 4.x. |
-| A function shows `SKIP` in `moodle_test.py` | That function isn't enabled for your account. The bot's other sources still work. |
-| Telegram test fails | Check the bot token and chat ID belong to the same bot, and that you've messaged the bot first. |
-| Group messages don't arrive | Chat ID must include the minus sign, and the bot must be a member of the group. |
-| Duplicate alerts | Two copies of the bot are running, or the Actions state isn't being restored. |
-| Alert flood on every run (Actions) | The cache isn't restoring. Check the "Restore state" step log. |
-| Scheduled workflow stopped | GitHub pauses idle repos after about 60 days. Re-enable it in the Actions tab. |
+| `enablewsdisabled` / `servicenotavailable` | The Moodle mobile web service is disabled by the site administrator. |
+| `invalidlogin` when requesting a token | Check credentials or use the SSO launch-flow method. |
+| Launch URL appears blank | Usually expected; inspect the `moodlemobile://token=...` redirect in DevTools. |
+| `invalidtoken` / token-expired alert | Create a fresh token and update `MOODLE_TOKEN`, or use the optional `/token` flow. |
+| `/token` gets no reply | Confirm you're in a private chat, your user ID is correct, and `TOKEN_ENCRYPTION_KEY` is configured. Run the workflow manually to apply a token sooner. |
+| `/token` says it can't store the token | Check that `TOKEN_ENCRYPTION_KEY` is present and valid; generate one with `--gen-key`. |
+| Forum call returns `invalidparameter` | Check the installed version's supported arguments; Moodle 4.x may reject optional sort parameters. |
+| A function shows `SKIP` in diagnostics | That function may not be enabled for your account; other alert sources may still work. |
+| Telegram test fails | Confirm the bot token and chat ID match and that you've started a chat with the bot. |
+| Group messages don't arrive | Keep the negative sign in the group ID and ensure the bot is a member. |
+| Duplicate alerts | Check for multiple running instances or missing Actions state restoration. |
+| Alerts repeat on every Actions run | Inspect the state-cache restore and save steps. |
+| Scheduled workflow stopped | Check workflow status in the Actions tab and re-enable it if necessary. |
 
 ## Limitations
 
-- It only sees what Moodle exposes to your account through the mobile service. Anything the admin has disabled isn't available.
-- With SSO there's no way to refresh the token automatically, so you renew it by hand when it expires (the bot tells you).
-- Detecting edits depends on Moodle's `timemodified` fields. Some plugin types don't update them reliably.
-- GitHub Actions schedules are best-effort: runs can be delayed by several minutes.
-- Very large course lists mean more API calls per run. Use `SKIP_COURSE_IDS` to trim them.
+- The bot can only read information exposed to your account through Moodle's mobile web service.
+- SSO tokens cannot always be refreshed automatically; you may need to renew them manually.
+- Change detection depends on timestamps exposed by Moodle and plugins, which may not always update reliably.
+- GitHub Actions schedules are not exact and may be delayed.
+- Large course lists can require additional API calls; use `SKIP_COURSE_IDS` to ignore courses you do not need.
 
 ## Project structure
 
-```
-moodle-notifier/
-├── moodle_bot.py                     # Moodle logic: API client, state, checks, scheduling, CLI
-├── telegram_notifier.py              # Telegram delivery + message formatting (no Moodle code)
-├── moodle_test.py                    # optional: checks what your Moodle allows
+```text
+Moodle-Notifier/
+├── moodle_bot.py                     # Moodle API, state, checks, scheduling, CLI
+├── telegram_notifier.py              # Telegram delivery and message formatting
+├── moodle_test.py                    # Optional Moodle capability diagnostic
 ├── requirements.txt
-├── .env.example                      # config template (copy to .env, never commit .env)
+├── .env.example                      # Configuration template; copy to .env
 ├── LICENSE
 ├── .gitignore
 └── .github/
     └── workflows/
-        └── moodle-bot.yml            # scheduled run + state caching
+        └── moodle-bot.yml            # Scheduled workflow and state caching
 ```
 
-### Swapping Telegram for something else
+## Use another notification channel
 
-`moodle_bot.py` only needs a `notify(text) -> bool` function (return `True` once the message is delivered, `False` to retry on the next run) and a `fmt(title, body, url)` helper. `telegram_notifier.py` provides both. To use another channel (Discord, email, ntfy...), write a module with the same two functions and change the import line at the top of `moodle_bot.py`.
+The bot's notification interface is intentionally small: `notify(text) -> bool` reports delivery success, and `fmt(title, body, url)` formats a message. `telegram_notifier.py` implements these helpers. To use Discord, email, ntfy, or another channel, implement the same helpers in a new module and update the import in `moodle_bot.py`.
 
 ## License
 
-This project is licensed under the MIT License.
-You are free to use, modify, and distribute this project, subject to the terms of the license.
+Released under the [MIT License](LICENSE). You are free to use, modify, and distribute this project subject to the license terms.
