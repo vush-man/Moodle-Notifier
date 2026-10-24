@@ -285,20 +285,25 @@ Function availability differs between sites and versions. The notification bell 
 - **Reminders.** For each deadline, only the tightest applicable window fires. A deadline first seen with 2 hours left gets one reminder, not both the 24 h and 3 h ones. Changing a due date resets its reminders.
 - **Completed work.** For quizzes and other calendar deadlines, events Moodle marks as not actionable (already done) are not reported. Assignments are the exception: they are handled separately and reminded about regardless.
 - **Ended courses.** Courses whose end date passed more than 7 days ago are skipped. Use `SKIP_COURSE_IDS` for others.
+- **Your own name is removed.** Before anything is sent, the bot strips the account owner's name from the text: the full name (in either order) and greetings such as "Hi NAME," that Moodle puts in some of its own notifications. Other people's names, including classmates or teachers who share your first or last name, are left alone.
 - **Hidden content.** Items you can't see (hidden or restricted) aren't reported until they become visible to you, at which point they count as new.
 - **Failure handling.** An expired token triggers a Telegram alert (at most once a day) and the run stops. The alert goes to your private chat with the bot (`TELEGRAM_ADMIN_ID`) rather than the group, and falls back to the main chat if the bot can't message you privately. Other errors are logged, and three consecutive failing runs trigger a warning.
 
 Example messages:
 
 ```
-📅 New / changed deadline
-CSN304 AI Mini Project is due
-Due: Fri 24 Oct, 11:59 PM
-https://lms.example.edu/mod/assign/view.php?id=123
+⏰ Assignment due in 1 day 6 h
 
-⏰ Due in ~3h
-...
+📝 Assignment: Mini Project
+📚 Course: CSN304
+📅 Deadline: Sat, 16 Jan 2027 (tomorrow)
+🕒 Due at: 7:30 PM
+⏳ Time left: 1 day 6 h
 
+🔗 https://lms.example.edu/mod/assign/view.php?id=123
+```
+
+```
 📢 Announcement · CSN203
 Graded Lab 03
 ...
@@ -307,6 +312,8 @@ Graded Lab 03
 Lecture 5 slides
 Section: Week 5
 ```
+
+Deadline messages (assignments, quizzes and other calendar events) use the same card layout. Dates always show the weekday, the month as a word and the year, plus a hint such as *(today)*, *(tomorrow)* or *(in 5 days)*, and the time is shown on its own line in 12-hour format. Times use `TZ_OFFSET_MINUTES`.
 
 ## Security notes
 
@@ -352,8 +359,8 @@ moodle-notifier/
 ├── moodle_test.py                    # optional: checks what your Moodle allows
 ├── requirements.txt
 ├── .env.example                      # config template (copy to .env, never commit .env)
-├── LICENSE
 ├── .gitignore
+├── LICENSE
 └── .github/
     └── workflows/
         └── moodle-bot.yml            # scheduled run + state caching

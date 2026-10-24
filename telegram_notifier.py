@@ -33,6 +33,34 @@ def fmt(title, body="", url=""):
     return "\n".join(parts)
 
 
+def fmt_card(title, rows, url=""):
+    """A readable 'card': bold title, a blank line, then one labelled line per row.
+
+        ⏰ Assignment due in 1 day 6 h
+
+        📝 Assignment: Lab 1
+        📅 Deadline: Sat, 16 Jan 2027 (tomorrow)
+
+    rows: (emoji, label, value) or (emoji, label, value, True) to bold the value too.
+    Rows with an empty value are skipped. Everything is escaped and capped, so Moodle
+    text can't break the formatting."""
+    lines = [f"<b>{html.escape(title)}</b>", ""]
+    for row in rows:
+        emoji, label, value = row[:3]
+        value = (value or "").strip()
+        if not value:
+            continue
+        if len(value) > 300:
+            value = value[:300].rstrip() + "…"
+        value = html.escape(value)
+        if len(row) > 3 and row[3]:
+            value = f"<b>{value}</b>"
+        lines.append(f"{emoji} <b>{html.escape(label)}:</b> {value}")
+    if url:
+        lines += ["", f"🔗 {html.escape(url)}"]
+    return "\n".join(lines)
+
+
 def send_message(token, chat_id, text):
     """Send one message. True if delivered; False means "try again later"."""
     for attempt in range(2):

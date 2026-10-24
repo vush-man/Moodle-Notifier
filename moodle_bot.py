@@ -39,6 +39,7 @@ import httpx
 from telegram_notifier import (
     delete_message,
     fmt,
+    fmt_card,
     get_chat_id,
     get_updates,
     make_notifier,
@@ -154,20 +155,47 @@ def short(s, n=60):
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def fmt_time(ts, tz):
-    return datetime.fromtimestamp(ts, tz).strftime("%a %d %b, %I:%M %p")
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def fmt_date(ts, tz, now):
+    """Sat, 16 Jan 2027 (tomorrow): weekday, month as a word, year, plus a relative hint.
+    Fixed English names, so the output doesn't depend on the machine's locale."""
+    dt = datetime.fromtimestamp(ts, tz)
+    days = (dt.date() - datetime.fromtimestamp(now, tz).date()).days
+    rel = {0: "today", 1: "tomorrow", -1: "yesterday"}.get(days) or (
+        f"in {days} days" if days > 1 else f"{-days} days ago"
+    )
+    return f"{DAYS[dt.weekday()]}, {dt.day} {MONTHS[dt.month - 1]} {dt.year} ({rel})"
+
+
+def fmt_clock(ts, tz):
+    """7:30 PM"""
+    return datetime.fromtimestamp(ts, tz).strftime("%I:%M %p").lstrip("0")
 
 
 def fmt_span(seconds):
-    """1 day 3 h / 5 h 20 min / 40 min"""
+    """1 day 6 h / 5 h 20 min / 2 h / 40 min"""
     days, rem = divmod(int(seconds), 86400)
     hours, rem = divmod(rem, 3600)
     mins = rem // 60
     if days:
-        return f"{days} day{'s' if days != 1 else ''} {hours} h"
+        return f"{days} day{'s' if days != 1 else ''}" + (f" {hours} h" if hours else "")
     if hours:
-        return f"{hours} h {mins} min"
+        return f"{hours} h" + (f" {mins} min" if mins else "")
     return f"{max(mins, 1)} min"
+
+
+def deadline_rows(label, name, course, due, tz, now):
+    """The rows shared by every deadline message (assignments, quizzes, ...)."""
+    return [
+        ("📝", label, name),
+        ("📚", "Course", course),
+        ("📅", "Deadline", fmt_date(due, tz, now) if due else "not set", True),
+        ("🕒", "Due at", fmt_clock(due, tz) if due else "", True),
+        ("⏳", "Time left", time_left(due, now)),
+    ]
 
 
 def time_left(due, now):
@@ -294,13 +322,18 @@ def check_deadlines(m, db, cfg, notify, now, skip_assign=False):
         and not (skip_assign and e.get("modulename") == "assign")
     ]
 
+    def card(e, title):
+        due = e.get("timesort") or e.get("timestart") or 0
+        course = short(
+            (e.get("course") or {}).get("shortname") or (e.get("course") or {}).get("fullname", "")
+        )
+        rows = deadline_rows("Event", strip_html(e.get("name", "")), course, due, cfg.tz, time.time())
+        return fmt_card(title, rows, e.get("url", ""))
+
     items = []
     for e in events:
-        due = e.get("timesort") or e.get("timestart") or 0
-        course = short((e.get("course") or {}).get("shortname") or (e.get("course") or {}).get("fullname", ""))
         fp = f"event:{e['id']}:{e.get('timemodified', 0)}"
-        body = f"{e.get('name', '')}\n{course}\nDue: {fmt_time(due, cfg.tz)}"
-        items.append((fp, fmt("📅 New / changed deadline", body, e.get("url", ""))))
+        items.append((fp, lambda e=e: card(e, "📅 New / changed deadline")))
     process(db, "events", items, notify)
 
     # Reminders: only the tightest applicable window fires, larger ones are marked done.
@@ -315,24 +348,16 @@ def check_deadlines(m, db, cfg, notify, now, skip_assign=False):
             fp = f"remind:{e['id']}:{due}:{h}"
             if db.seen(fp):
                 continue
-            if h == smallest:
-                course = short((e.get("course") or {}).get("shortname", ""))
-                left = f"{hours_left:.0f}h" if hours_left >= 1 else f"{hours_left * 60:.0f} min"
-                body = f"{e.get('name', '')}\n{course}\nDue: {fmt_time(due, cfg.tz)}"
-                if not notify(fmt(f"⏰ Due in ~{left}", body, e.get("url", ""))):
-                    continue
+            if h == smallest and not notify(card(e, f"⏰ Due in {fmt_span(due - now)}")):
+                continue
             db.add(fp)
 
 
 def assignment_message(cfg, a, cname, title):
-    due = a.get("duedate") or 0
-    body = (
-        f"{strip_html(a.get('name', ''))}\n{cname}\n"
-        f"Deadline: {fmt_time(due, cfg.tz) if due else 'not set'}\n"
-        f"Time left: {time_left(due, time.time())}"
+    rows = deadline_rows(
+        "Assignment", strip_html(a.get("name", "")), cname, a.get("duedate") or 0, cfg.tz, time.time()
     )
-    url = f"{cfg.base}/mod/assign/view.php?id={a.get('cmid', '')}"
-    return fmt(title, body, url)
+    return fmt_card(title, rows, f"{cfg.base}/mod/assign/view.php?id={a.get('cmid', '')}")
 
 
 def check_assignments(m, db, cfg, notify, courses, now):
@@ -647,6 +672,52 @@ def handle_telegram_commands(cfg, db):
         finish("✅ Moodle token updated", "It will be used from the next check. Your message was deleted.")
 
 
+def build_redactor(info):
+    """Returns redact(text), which removes the account owner's OWN name from outgoing
+    messages: the full name (either order) and greetings like "Hi NAME,". Other people's
+    names are left alone, including those sharing your first or last name."""
+    words = re.findall(r"[^\W\d_]{2,}", info.get("fullname") or "")
+    if not words:
+        words = re.findall(
+            r"[^\W\d_]{2,}", f"{info.get('firstname') or ''} {info.get('lastname') or ''}"
+        )
+    if not words:
+        return lambda text: text
+    first, last = re.escape(words[0]), re.escape(words[-1])
+    sep = r"[\s,.]+"
+    full = "(?:{}|{}|{})".format(
+        sep.join(re.escape(w) for w in words),
+        sep.join(re.escape(w) for w in reversed(words)),
+        f"{first}{sep}{last}|{last}{sep}{first}",
+    )
+    anyname = f"(?:{full}|{first})"  # a bare surname is not stripped: it could be a teacher's
+    greeting = re.compile(
+        rf"\b(?:hi|hello|hey|dear)\s+{anyname}\b[\s,:!.\-]*(?P<next>[a-z])?", re.IGNORECASE
+    )
+    vocative = re.compile(
+        rf"(?m)^([ \t]*)(?:{full}|{first})[ \t]*,[ \t]*(?P<next>[a-z])?", re.IGNORECASE
+    )
+    bracketed = re.compile(rf"[ \t]*[(\[][ \t]*{full}[ \t]*[)\]]", re.IGNORECASE)
+    after_sep = re.compile(rf"[ \t]*[-–—|:,][ \t]*\b{full}\b", re.IGNORECASE)
+    fullname = re.compile(rf"\b{full}\b", re.IGNORECASE)
+
+    def cap(m):  # keep the sentence tidy: "Hi Ann, your quiz" -> "Your quiz"
+        return (m.group("next") or "").upper()
+
+    def redact(text):
+        text = greeting.sub(cap, text)
+        text = vocative.sub(lambda m: m.group(1) + cap(m), text)
+        text = bracketed.sub("", text)  # "Lab 3 (NAME)"   -> "Lab 3"
+        text = after_sep.sub("", text)  # "Quiz - NAME"    -> "Quiz"
+        text = fullname.sub("", text)
+        text = re.sub(r"[ \t]+([,.;:!?])", r"\1", text)  # no stray space before punctuation
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        return text
+
+    return redact
+
+
 def make_admin_notifier(cfg, notify):
     """Operational alerts (like an expired token) go to the admin's private chat, so
     group members don't see them. A private chat id equals the user's id. Falls back
@@ -740,10 +811,12 @@ def main():
             log.exception("Telegram command handling failed")
         m.token = effective_token(cfg, db)
         try:
-            userid = m.call("core_webservice_get_site_info")["userid"]
+            info = m.call("core_webservice_get_site_info")
+            userid = info["userid"]
             if db.get("userid") is None:
                 db.set("userid", userid)  # remembered so /token can't switch accounts
-            run_cycle(cfg, m, db, notify, userid)
+            redact = build_redactor(info)  # alerts never contain your own name
+            run_cycle(cfg, m, db, lambda text: notify(redact(text)), userid)
         except TokenExpired as e:
             log.error("Token expired: %s", e)
             token_alert(cfg, db, notify_admin, str(e))
